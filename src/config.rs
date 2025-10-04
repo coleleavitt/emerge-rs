@@ -45,7 +45,7 @@ impl Config {
 
         // Load profile settings first (lower precedence)
         // If profile loading fails, use defaults (for testing or minimal setups)
-        if let Err(_) = config.load_profile_settings().await {
+        if let Err(_e) = config.load_profile_settings().await {
             config.profile_settings = ProfileSettings::default();
         }
 

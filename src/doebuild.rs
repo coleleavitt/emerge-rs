@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use crate::exception::InvalidData;
 use crate::atom::Atom;
-use crate::ebuild_exec::EbuildExecutor;
 use chrono;
 use nix::unistd;
+use crate::ebuild::EbuildEnvironment;
+use crate::ebuild::src_uri::expand_string;
 
 /// Represents an ebuild file and its metadata
 #[derive(Debug, Clone)]
@@ -33,6 +34,8 @@ pub struct EbuildMetadata {
     pub depend: Vec<crate::dep::Atom>,
     pub rdepend: Vec<crate::dep::Atom>,
     pub pdepend: Vec<crate::dep::Atom>,
+    pub inherit: Vec<String>,
+    pub eapi: String,
 }
 
 /// Build environment for ebuild execution
@@ -45,7 +48,7 @@ pub struct BuildEnv {
     pub distdir: PathBuf,
     pub use_flags: HashMap<String, bool>,
     pub env_vars: HashMap<String, String>,
-    pub executor: Option<EbuildExecutor>,
+    pub native_executor: crate::ebuild::NativePhaseExecutor,
     // Build environment management
     pub features: Vec<String>,
     pub sandbox_enabled: bool,
@@ -64,12 +67,14 @@ pub enum BuildUser {
 #[derive(Debug, Clone, Copy)]
 pub enum BuildPhase {
     Setup,
+    Fetch,
     Unpack,
     Prepare,
     Configure,
     Compile,
     Test,
     Install,
+    Merge,
     Package,
 }
 
@@ -101,15 +106,28 @@ impl Ebuild {
         let filename = parts.last().unwrap();
         let filename_no_ext = filename.trim_end_matches(".ebuild");
 
-        // Split package-version
-        let last_dash = filename_no_ext.rfind('-').ok_or_else(|| {
-            InvalidData::new("Invalid ebuild filename format", None)
-        })?;
+        let mut package = String::new();
+        let mut version = String::new();
+        
+        let mut found_version = false;
+        for (i, c) in filename_no_ext.chars().enumerate() {
+            if !found_version && c == '-' {
+                if let Some(next_char) = filename_no_ext.chars().nth(i + 1) {
+                    if next_char.is_ascii_digit() {
+                        package = filename_no_ext[..i].to_string();
+                        version = filename_no_ext[i + 1..].to_string();
+                        found_version = true;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if package.is_empty() || version.is_empty() {
+            return Err(InvalidData::new("Invalid ebuild filename format", None));
+        }
 
-        let package = filename_no_ext[..last_dash].to_string();
-        let version = filename_no_ext[last_dash + 1..].to_string();
-
-        let metadata = Self::parse_metadata_with_use(&content, use_flags)?;
+        let metadata = Self::parse_metadata_with_use(&content, use_flags, &category, &package, &version)?;
 
         Ok(Ebuild {
             path: path.to_path_buf(),
@@ -122,11 +140,11 @@ impl Ebuild {
 
     /// Parse ebuild metadata from content
     pub fn parse_metadata(content: &str) -> Result<EbuildMetadata, InvalidData> {
-        Self::parse_metadata_with_use(content, &std::collections::HashMap::new())
+        Self::parse_metadata_with_use(content, &std::collections::HashMap::new(), "", "", "")
     }
 
     /// Parse ebuild metadata from content with USE flags
-    pub fn parse_metadata_with_use(content: &str, use_flags: &std::collections::HashMap<String, bool>) -> Result<EbuildMetadata, InvalidData> {
+    pub fn parse_metadata_with_use(content: &str, use_flags: &std::collections::HashMap<String, bool>, category: &str, package: &str, version: &str) -> Result<EbuildMetadata, InvalidData> {
         let mut metadata = EbuildMetadata {
             description: None,
             homepage: None,
@@ -138,41 +156,97 @@ impl Ebuild {
             depend: Vec::new(),
             rdepend: Vec::new(),
             pdepend: Vec::new(),
+            inherit: Vec::new(),
+            eapi: "8".to_string(),
         };
 
-        // Simple parsing of bash variable assignments
+        let mut variables = std::collections::HashMap::new();
+        
+        let (pv, pr) = if let Some(r_pos) = version.rfind("-r") {
+            if version[r_pos + 2..].chars().all(|c| c.is_ascii_digit()) {
+                (&version[..r_pos], &version[r_pos + 1..])
+            } else {
+                (version, "r0")
+            }
+        } else {
+            (version, "r0")
+        };
+        
+        variables.insert("PN".to_string(), package.to_string());
+        variables.insert("PV".to_string(), pv.to_string());
+        variables.insert("P".to_string(), format!("{}-{}", package, pv));
+        variables.insert("PF".to_string(), format!("{}-{}", package, version));
+        variables.insert("PR".to_string(), pr.to_string());
+        variables.insert("CATEGORY".to_string(), category.to_string());
+        variables.insert("CP".to_string(), format!("{}/{}", category, package));
+        variables.insert("CPV".to_string(), format!("{}/{}-{}", category, package, version));
+        
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with("DESCRIPTION=") {
+            if let Some(eq_pos) = line.find('=') {
+                if eq_pos > 0 && line.as_bytes().get(eq_pos - 1) != Some(&b'+') {
+                    let var_name = line[..eq_pos].trim();
+                    if let Some(value) = Self::extract_raw_value(line) {
+                        let expanded_value = expand_string(&value, &variables).unwrap_or(value.clone());
+                        variables.insert(var_name.to_string(), expanded_value);
+                    }
+                }
+            }
+        }
+        
+        if !variables.contains_key("MY_P") {
+            variables.insert("MY_P".to_string(), format!("{}-{}", package, version));
+        }
+        if !variables.contains_key("MY_PN") {
+            variables.insert("MY_PN".to_string(), package.to_string());
+        }
+        if !variables.contains_key("MY_PV") {
+            variables.insert("MY_PV".to_string(), version.to_string());
+        }
+
+        // Second pass: parse metadata with variable expansion
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with("EAPI=") {
+                metadata.eapi = Self::extract_quoted_value(line).unwrap_or_else(|| "8".to_string());
+            } else if line.starts_with("inherit ") {
+                let inherit_line = &line[8..]; // Skip "inherit "
+                metadata.inherit = inherit_line.split_whitespace().map(|s| s.to_string()).collect();
+            } else if line.starts_with("DESCRIPTION=") {
                 metadata.description = Self::extract_quoted_value(line);
             } else if line.starts_with("HOMEPAGE=") {
                 metadata.homepage = Self::extract_quoted_value(line);
-            } else if line.starts_with("SRC_URI=") {
-                metadata.src_uri = Self::extract_array_value(line);
+            } else if line.starts_with("SRC_URI=") || line.starts_with("SRC_URI+=") {
+                let mut current_src_uri = Self::extract_array_value_with_vars(line, &variables);
+                metadata.src_uri.extend(current_src_uri);
             } else if line.starts_with("LICENSE=") {
                 metadata.license = Self::extract_quoted_value(line);
             } else if line.starts_with("SLOT=") {
                 metadata.slot = Self::extract_quoted_value(line).unwrap_or_else(|| "0".to_string());
             } else if line.starts_with("KEYWORDS=") {
-                metadata.keywords = Self::extract_array_value(line);
+                metadata.keywords = Self::extract_array_value_with_vars(line, &variables);
             } else if line.starts_with("IUSE=") {
-                metadata.iuse = Self::extract_array_value(line);
+                metadata.iuse = Self::extract_array_value_with_vars(line, &variables);
             } else if line.starts_with("DEPEND=") {
-                if let Some(dep_str) = Self::extract_raw_value(line) {
+                if let Some(dep_str) = Self::extract_raw_value_with_vars(line, &variables) {
                     metadata.depend = crate::dep::parse_dependencies_with_use(&dep_str, &use_flags).unwrap_or_default();
                 }
             } else if line.starts_with("RDEPEND=") {
-                if let Some(dep_str) = Self::extract_raw_value(line) {
+                if let Some(dep_str) = Self::extract_raw_value_with_vars(line, &variables) {
                     metadata.rdepend = crate::dep::parse_dependencies_with_use(&dep_str, &use_flags).unwrap_or_default();
                 }
             } else if line.starts_with("PDEPEND=") {
-                if let Some(dep_str) = Self::extract_raw_value(line) {
+                if let Some(dep_str) = Self::extract_raw_value_with_vars(line, &variables) {
                     metadata.pdepend = crate::dep::parse_dependencies_with_use(&dep_str, &use_flags).unwrap_or_default();
                 }
             }
         }
 
         Ok(metadata)
+    }
+
+    fn expand_variables(input: &str, variables: &std::collections::HashMap<String, String>) -> String {
+        expand_string(input, variables).unwrap_or_else(|_| input.to_string())
     }
 
     /// Extract quoted string value from bash variable assignment
@@ -190,6 +264,11 @@ impl Ebuild {
     }
 
     /// Extract raw value from bash variable assignment
+    fn extract_raw_value_with_vars(line: &str, variables: &std::collections::HashMap<String, String>) -> Option<String> {
+        let expanded_line = Self::expand_variables(line, variables);
+        Self::extract_raw_value(&expanded_line)
+    }
+
     fn extract_raw_value(line: &str) -> Option<String> {
         let eq_pos = line.find('=')?;
         let value_part = &line[eq_pos + 1..].trim();
@@ -199,22 +278,66 @@ impl Ebuild {
     }
 
     /// Extract array value from bash variable assignment
+    fn extract_array_value_with_vars(line: &str, variables: &std::collections::HashMap<String, String>) -> Vec<String> {
+        let expanded_line = Self::expand_variables(line, variables);
+        Self::extract_array_value(&expanded_line)
+    }
+
     fn extract_array_value(line: &str) -> Vec<String> {
         let eq_pos = line.find('=');
         if eq_pos.is_none() {
             return Vec::new();
         }
 
-        let value_part = &line[eq_pos.unwrap() + 1..].trim();
+        let eq_pos = eq_pos.unwrap();
+        let mut value_part = line[eq_pos + 1..].trim().to_string();
+
+        // Handle += syntax - skip the +
+        if eq_pos > 0 && line.as_bytes()[eq_pos - 1] == b'+' {
+            // This is +=, skip the + in value_part
+            if value_part.starts_with('+') {
+                value_part = value_part[1..].trim().to_string();
+            }
+        }
+
+        // Trim again in case there are extra spaces
+        value_part = value_part.trim().to_string();
 
         if value_part.starts_with('(') && value_part.ends_with(')') {
+            // Array format: SRC_URI=( "uri1" "uri2" )
             let inner = &value_part[1..value_part.len() - 1];
             inner.split_whitespace()
                 .map(|s| s.trim_matches('"').trim_matches('\'').to_string())
                 .filter(|s| !s.is_empty())
                 .collect()
-        } else {
+        } else if &value_part == "\"" || &value_part == "'" {
+            // Incomplete quoted string (multiline assignment)
             Vec::new()
+        } else if value_part.starts_with('"') && value_part.ends_with('"') && value_part.len() >= 2 {
+            // String format: SRC_URI="uri1 uri2"
+            let inner = &value_part[1..value_part.len() - 1];
+            if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split_whitespace()
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+        } else if value_part.starts_with('\'') && value_part.ends_with('\'') && value_part.len() >= 2 {
+            // Single quoted string format: SRC_URI='uri1 uri2'
+            let inner = &value_part[1..value_part.len() - 1];
+            if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split_whitespace()
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+        } else {
+            // Unquoted format: SRC_URI=uri1
+            vec![value_part.to_string()]
         }
     }
 
@@ -227,29 +350,195 @@ impl Ebuild {
     pub fn cp(&self) -> String {
         format!("{}/{}", self.category, self.package)
     }
+    
+    /// Get the PF (package-version)
+    pub fn pf(&self) -> String {
+        format!("{}-{}", self.package, self.version)
+    }
 }
 
 impl BuildEnv {
+    /// Convert to EbuildEnvironment for use with Rust ebuild module
+    pub fn to_ebuild_env(&self) -> EbuildEnvironment {
+        use crate::ebuild::environment::EbuildEnvironment;
+        
+        let use_flags: Vec<String> = self.use_flags.iter()
+            .filter(|&(_, &enabled)| enabled)
+            .map(|(flag, _)| flag.clone())
+            .collect();
+            
+        let mut env = EbuildEnvironment::new(
+            self.workdir.clone(),
+            use_flags
+        );
+        
+        // Copy environment variables
+        for (key, value) in &self.env_vars {
+            env.set(key.clone(), value.clone());
+        }
+        
+        // Set directories
+        env.sourcedir = self.sourcedir.clone();
+        env.destdir = self.destdir.clone();
+        env.builddir = self.builddir.clone();
+        
+        env
+    }
+
+    /// Extract archive filenames from SRC_URI
+    fn extract_archive_names(src_uri: &[String]) -> String {
+        let mut archives = Vec::new();
+
+        for uri in src_uri {
+            // Extract filename from URI (last component after /)
+            if let Some(filename) = uri.split('/').last() {
+                // Remove query parameters if present
+                let filename = filename.split('?').next().unwrap_or(filename);
+                // Remove fragment if present
+                let filename = filename.split('#').next().unwrap_or(filename);
+                archives.push(filename.to_string());
+            }
+        }
+
+        archives.join(" ")
+    }
+
+    /// Extract archive filenames from expanded SRC_URI string
+    fn extract_archive_names_from_string(src_uri: &str) -> String {
+        use std::collections::HashMap;
+
+        let uri_map = Self::parse_src_uri_for_archives(src_uri);
+        uri_map.keys().cloned().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Parse SRC_URI to extract archive names (simplified version of parse_src_uri)
+    fn parse_src_uri_for_archives(src_uri: &str) -> HashMap<String, Vec<String>> {
+        let mut uri_map = HashMap::new();
+        let mut current_uris = Vec::new();
+        let mut current_filename = None;
+
+        for token in src_uri.split_whitespace() {
+            if token.contains("://") {
+                // This is a URI
+                current_uris.push(token.to_string());
+            } else if token == "->" {
+                // Next token will be the filename
+                continue;
+            } else {
+                // This is a filename (after ->)
+                if let Some(filename) = current_filename.take() {
+                    uri_map.insert(filename, current_uris.clone());
+                }
+                current_filename = Some(token.to_string());
+                current_uris.clear();
+            }
+        }
+
+        // Handle the last set
+        if let Some(filename) = current_filename {
+            uri_map.insert(filename, current_uris);
+        } else if !current_uris.is_empty() {
+            // No explicit filename, extract from URI
+            for uri in current_uris {
+                if let Some(filename) = Self::extract_filename_from_uri(&uri) {
+                    uri_map.insert(filename, vec![uri]);
+                }
+            }
+        }
+
+        uri_map
+    }
+
+    /// Extract filename from URI
+    fn extract_filename_from_uri(uri: &str) -> Option<String> {
+        uri.split('/').last()
+            .and_then(|s| s.split('?').next())
+            .and_then(|s| s.split('#').next())
+            .map(|s| s.to_string())
+    }
+
+    /// Expand variables in a string using ebuild information
+    fn expand_variables(input: &str, ebuild: &Ebuild) -> String {
+        let mut result = input.to_string();
+
+        // Replace common variables
+        result = result.replace("${PN}", &ebuild.package);
+        result = result.replace("${P}", &format!("{}-{}", ebuild.package, ebuild.version));
+        result = result.replace("${PV}", &ebuild.version);
+        result = result.replace("${PF}", &ebuild.pf());
+        result = result.replace("${CATEGORY}", &ebuild.category);
+
+        // Handle ${PN} without braces
+        result = result.replace("$PN", &ebuild.package);
+        result = result.replace("$P", &format!("{}-{}", ebuild.package, ebuild.version));
+        result = result.replace("$PV", &ebuild.version);
+        result = result.replace("$PF", &ebuild.pf());
+        result = result.replace("$CATEGORY", &ebuild.category);
+
+        result
+    }
+
     /// Create a new build environment for an ebuild
     pub fn new(ebuild: &Ebuild, portdir: &Path, distdir: &Path, use_flags: HashMap<String, bool>, features: Vec<String>) -> Self {
-        // Use a temporary directory for testing
-        let temp_dir = std::env::temp_dir();
-        let workdir = temp_dir.join("emerge-rs-build").join(&ebuild.cpv());
-        let sourcedir = workdir.join(format!("{}-{}", ebuild.package, ebuild.version));
-        let builddir = workdir.join("build");
-        let destdir = workdir.join("image");
+        // Use PORTAGE_TMPDIR/portage like Portage does
+        // Default to /var/tmp if not set (see portage/cnf/make.globals)
+        let portage_tmpdir = std::env::var("PORTAGE_TMPDIR").unwrap_or_else(|_| "/var/tmp".to_string());
+        let build_prefix = PathBuf::from(&portage_tmpdir).join("portage");
+        
+        // PORTAGE_BUILDDIR = BUILD_PREFIX/CATEGORY/PF
+        let portage_builddir = build_prefix.join(&ebuild.category).join(&ebuild.pf());
+        
+        // Set up directories like Portage does:
+        // WORKDIR = PORTAGE_BUILDDIR/work
+        // D = PORTAGE_BUILDDIR/image/
+        let workdir = portage_builddir.join("work");
+        
+        // Extract PV (version without revision) from the full version
+        let pv = if let Some((_, ver, _)) = crate::versions::pkgsplit(&format!("{}-{}", ebuild.package, ebuild.version)) {
+            ver
+        } else {
+            ebuild.version.clone()
+        };
+        
+        let sourcedir = workdir.join(format!("{}-{}", ebuild.package, pv));
+        let builddir = portage_builddir.join("build");
+        let destdir = portage_builddir.join("image");
 
+        // Get the ebuild's directory (O) and set up FILESDIR
+        let ebuild_dir = ebuild.path.parent().unwrap_or(Path::new("."));
+        let filesdir = portage_builddir.join("files");
+        let temp_dir = portage_builddir.join("temp");
+        
         let mut env_vars = HashMap::new();
+        env_vars.insert("PORTAGE_TMPDIR".to_string(), portage_tmpdir.clone());
+        env_vars.insert("BUILD_PREFIX".to_string(), build_prefix.to_string_lossy().to_string());
+        env_vars.insert("PORTAGE_BUILDDIR".to_string(), portage_builddir.to_string_lossy().to_string());
         env_vars.insert("WORKDIR".to_string(), workdir.to_string_lossy().to_string());
         env_vars.insert("S".to_string(), sourcedir.to_string_lossy().to_string());
         env_vars.insert("BUILD_DIR".to_string(), builddir.to_string_lossy().to_string());
-        env_vars.insert("D".to_string(), destdir.to_string_lossy().to_string());
+        env_vars.insert("D".to_string(), format!("{}/", destdir.to_string_lossy())); // D ends with /
+        env_vars.insert("T".to_string(), temp_dir.to_string_lossy().to_string());
         env_vars.insert("PORTDIR".to_string(), portdir.to_string_lossy().to_string());
         env_vars.insert("DISTDIR".to_string(), distdir.to_string_lossy().to_string());
-        env_vars.insert("PV".to_string(), ebuild.version.clone());
+        env_vars.insert("EBUILD".to_string(), ebuild.path.to_string_lossy().to_string());
+        env_vars.insert("O".to_string(), ebuild_dir.to_string_lossy().to_string());
+        env_vars.insert("FILESDIR".to_string(), filesdir.to_string_lossy().to_string());
+
+        // Set PATH to include standard directories
+        env_vars.insert("PATH".to_string(), "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+        env_vars.insert("PV".to_string(), pv.clone());
         env_vars.insert("PN".to_string(), ebuild.package.clone());
-        env_vars.insert("P".to_string(), format!("{}-{}", ebuild.package, ebuild.version));
+        env_vars.insert("P".to_string(), format!("{}-{}", ebuild.package, pv));
+        env_vars.insert("PF".to_string(), ebuild.pf());
         env_vars.insert("CATEGORY".to_string(), ebuild.category.clone());
+
+        // Set SRC_URI and A variables
+        let src_uri_value = ebuild.metadata.src_uri.join(" ");
+        // Expand variables in SRC_URI
+        let expanded_src_uri = Self::expand_variables(&src_uri_value, &ebuild);
+        env_vars.insert("SRC_URI".to_string(), expanded_src_uri.clone());
+        let a_value = Self::extract_archive_names_from_string(&expanded_src_uri);
+        env_vars.insert("A".to_string(), a_value);
 
         // Determine sandbox and user settings based on features
         let sandbox_enabled = features.contains(&"sandbox".to_string());
@@ -259,12 +548,18 @@ impl BuildEnv {
         if sandbox_enabled {
             env_vars.insert("SANDBOX_ON".to_string(), "1".to_string());
             // Add sandbox-specific environment variables
-            env_vars.insert("SANDBOX_WRITE".to_string(), format!("{}:{}", destdir.display(), workdir.display()));
+            env_vars.insert("SANDBOX_WRITE".to_string(), format!("{}:{}", destdir.display(), portage_builddir.display()));
             env_vars.insert("SANDBOX_PREDICT".to_string(), "/proc:/dev:/sys".to_string());
         }
 
+        // Create a temporary native executor (will be replaced in doebuild)
+        let native_executor = crate::ebuild::NativePhaseExecutor::new(
+            &Vec::new(),
+            &sourcedir
+        );
+        
         BuildEnv {
-            workdir,
+            workdir: portage_builddir,  // Use PORTAGE_BUILDDIR as workdir
             sourcedir,
             builddir,
             destdir,
@@ -272,7 +567,7 @@ impl BuildEnv {
             distdir: distdir.to_path_buf(),
             use_flags,
             env_vars,
-            executor: None, // Will be set later in doebuild
+            native_executor,
             features,
             sandbox_enabled,
             user_privilege,
@@ -318,21 +613,92 @@ impl BuildEnv {
 
     /// Set up the build environment directories
     pub fn setup(&self) -> Result<(), InvalidData> {
+        use std::os::unix::fs::PermissionsExt;
+        
+        // Create base build directory with proper permissions BEFORE any user switching
+        // This is PORTAGE_TMPDIR/portage (BUILD_PREFIX)
+        let portage_tmpdir = std::env::var("PORTAGE_TMPDIR").unwrap_or_else(|_| "/var/tmp".to_string());
+        let base_build_dir = PathBuf::from(&portage_tmpdir).join("portage");
+        
+        if !base_build_dir.exists() {
+            fs::create_dir_all(&base_build_dir)
+                .map_err(|e| InvalidData::new(&format!("Failed to create base build dir: {}", e), None))?;
+            
+            // Set sticky bit + world writable permissions so portage user can create subdirs
+            fs::set_permissions(&base_build_dir, fs::Permissions::from_mode(0o1777))
+                .map_err(|e| InvalidData::new(&format!("Failed to set base build dir permissions: {}", e), None))?;
+        }
+        
+        // Create PORTAGE_BUILDDIR (workdir in our struct)
         fs::create_dir_all(&self.workdir)
-            .map_err(|e| InvalidData::new(&format!("Failed to create workdir: {}", e), None))?;
-        fs::create_dir_all(&self.sourcedir)
-            .map_err(|e| InvalidData::new(&format!("Failed to create sourcedir: {}", e), None))?;
+            .map_err(|e| {
+                // Provide helpful error message if permission denied
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    InvalidData::new(&format!(
+                        "Failed to create PORTAGE_BUILDDIR: {}\n\
+                         You may need to run emerge-rs with sudo, or ensure {} is writable by your user.\n\
+                         Alternatively, set PORTAGE_TMPDIR to a directory you own.",
+                        e, base_build_dir.display()
+                    ), None)
+                } else {
+                    InvalidData::new(&format!("Failed to create PORTAGE_BUILDDIR: {}", e), None)
+                }
+            })?;
+        
+        // Set ownership and permissions on PORTAGE_BUILDDIR if using portage user
+        if let BuildUser::Portage { uid, gid } = &self.user_privilege {
+            let output = Command::new("chown")
+                .arg("-R")
+                .arg(format!("{}:{}", uid, gid))
+                .arg(&self.workdir)
+                .output();
+            
+            if let Err(e) = output {
+                eprintln!("Warning: Failed to chown PORTAGE_BUILDDIR to portage: {}", e);
+            } else if let Ok(output) = output {
+                if !output.status.success() {
+                    eprintln!("Warning: chown failed: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+        }
+        
+        fs::set_permissions(&self.workdir, fs::Permissions::from_mode(0o755))
+            .map_err(|e| InvalidData::new(&format!("Failed to set PORTAGE_BUILDDIR permissions: {}", e), None))?;
+        
+        // Create subdirectories (WORKDIR, BUILD_DIR, D, T)
+        // Note: sourcedir is under WORKDIR which is under PORTAGE_BUILDDIR
+        let actual_workdir = self.workdir.join("work");
+        fs::create_dir_all(&actual_workdir)
+            .map_err(|e| InvalidData::new(&format!("Failed to create WORKDIR: {}", e), None))?;
         fs::create_dir_all(&self.builddir)
-            .map_err(|e| InvalidData::new(&format!("Failed to create builddir: {}", e), None))?;
+            .map_err(|e| InvalidData::new(&format!("Failed to create BUILD_DIR: {}", e), None))?;
         fs::create_dir_all(&self.destdir)
-            .map_err(|e| InvalidData::new(&format!("Failed to create destdir: {}", e), None))?;
+            .map_err(|e| InvalidData::new(&format!("Failed to create D: {}", e), None))?;
+        
+        let temp_dir = self.workdir.join("temp");
+        fs::create_dir_all(&temp_dir)
+            .map_err(|e| InvalidData::new(&format!("Failed to create T: {}", e), None))?;
+        
+        // Create FILESDIR symlink to real files directory (like Portage does)
+        // FILESDIR = PORTAGE_BUILDDIR/files -> $O/files
+        let filesdir = self.workdir.join("files");
+        if let Some(o_dir) = self.env_vars.get("O") {
+            let real_filesdir = PathBuf::from(o_dir).join("files");
+            // Remove old symlink if exists
+            let _ = fs::remove_file(&filesdir);
+            // Create symlink if the real files directory exists
+            if real_filesdir.exists() {
+                std::os::unix::fs::symlink(&real_filesdir, &filesdir)
+                    .map_err(|e| InvalidData::new(&format!("Failed to create FILESDIR symlink: {}", e), None))?;
+            }
+        }
 
         // Set up sandbox if enabled
         if self.sandbox_enabled {
             self.setup_sandbox()?;
         }
 
-        // Set up user privileges
+        // Set up user privileges (ownership of directories)
         self.setup_user_privileges()?;
 
         Ok(())
@@ -398,418 +764,95 @@ impl BuildEnv {
         Ok(())
     }
 
-    /// Execute a build phase
     pub async fn execute_phase(&self, ebuild: &Ebuild, phase: BuildPhase) -> Result<(), InvalidData> {
         match phase {
             BuildPhase::Setup => self.phase_setup().await,
+            BuildPhase::Fetch => self.phase_fetch(ebuild).await,
             BuildPhase::Unpack => self.phase_unpack(ebuild).await,
             BuildPhase::Prepare => self.phase_prepare(ebuild).await,
             BuildPhase::Configure => self.phase_configure(ebuild).await,
             BuildPhase::Compile => self.phase_compile(ebuild).await,
             BuildPhase::Test => self.phase_test(ebuild).await,
             BuildPhase::Install => self.phase_install(ebuild).await,
+            BuildPhase::Merge => self.phase_merge(ebuild).await,
             BuildPhase::Package => self.phase_package(ebuild).await,
         }
     }
 
     async fn phase_setup(&self) -> Result<(), InvalidData> {
-        // Create basic directory structure
         println!("Setting up build environment...");
 
-        // Switch to build user if configured
-        self.switch_to_build_user()?;
-
-        // Sandbox setup is already done in BuildEnv::setup()
-        // but we can do additional phase-specific setup here if needed
+        // Note: We intentionally do NOT switch users here because:
+        // 1. Once we drop from root to portage, we can't regain root for the merge phase
+        // 2. The merge phase requires root to install files to system directories
+        // TODO: Implement proper privilege separation using fork/exec
+        // self.switch_to_build_user()?;
 
         Ok(())
     }
+    
+    async fn phase_fetch(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
+        println!("Fetching sources for {}...", ebuild.cpv());
+
+        let env = self.to_ebuild_env();
+        self.native_executor.fetch(&env)
+    }
 
     async fn phase_unpack(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
-        use tokio::process::Command;
-
         println!("Unpacking sources for {}...", ebuild.cpv());
 
-        // Check if there's a custom src_unpack function
-        if let Some(executor) = &self.executor {
-            if executor.has_function("src_unpack") {
-                println!("Executing custom src_unpack function");
-                return executor.execute_function("src_unpack", self);
-            }
-        }
-
-        // Default src_unpack implementation
-        // Check if this is the test hello package
-        if ebuild.package == "hello" && ebuild.category == "app-misc" {
-            // Special handling for test hello package - just create the source directory
-            if let Err(e) = tokio::fs::create_dir_all(&self.sourcedir).await {
-                return Err(InvalidData::new(&format!("Failed to create source directory: {}", e), None));
-            }
-            println!("Created source directory");
-            return Ok(());
-        }
-
-        // Default src_unpack implementation
-        for uri in &ebuild.metadata.src_uri {
-            println!("Downloading: {}", uri);
-
-            // Extract filename from URI
-            let filename = uri.split('/').last().unwrap_or("unknown.tar.gz");
-
-            // Download the file
-            let output = Command::new("wget")
-                .arg("-O")
-                .arg(self.distdir.join(filename))
-                .arg(uri)
-                .output()
-                .await;
-
-            match output {
-                Ok(result) if result.status.success() => {
-                    println!("Downloaded: {}", filename);
-                }
-                Ok(result) => {
-                    eprintln!("Failed to download {}: {}", uri, String::from_utf8_lossy(&result.stderr));
-                    return Err(InvalidData::new(&format!("Download failed for {}", uri), None));
-                }
-                Err(e) => {
-                    eprintln!("Failed to run wget: {}", e);
-                    return Err(InvalidData::new(&format!("Download command failed: {}", e), None));
-                }
-            }
-
-            // Extract the file
-            let file_path = self.distdir.join(filename);
-            if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
-                let output = Command::new("tar")
-                    .arg("-xzf")
-                    .arg(&file_path)
-                    .arg("-C")
-                    .arg(&self.sourcedir)
-                    .output().await;
-
-                match output {
-                    Ok(result) if result.status.success() => {
-                        println!("Extracted: {}", filename);
-                    }
-                    Ok(result) => {
-                        eprintln!("Failed to extract {}: {}", filename, String::from_utf8_lossy(&result.stderr));
-                        return Err(InvalidData::new(&format!("Extraction failed for {}", filename), None));
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to run tar: {}", e);
-                        return Err(InvalidData::new(&format!("Extraction command failed: {}", e), None));
-                    }
-                }
-            } else if filename.ends_with(".tar.bz2") || filename.ends_with(".tbz2") {
-                let output = Command::new("tar")
-                    .arg("-xjf")
-                    .arg(&file_path)
-                    .arg("-C")
-                    .arg(&self.sourcedir)
-                    .output().await;
-
-                match output {
-                    Ok(result) if result.status.success() => {
-                        println!("Extracted: {}", filename);
-                    }
-                    Ok(result) => {
-                        eprintln!("Failed to extract {}: {}", filename, String::from_utf8_lossy(&result.stderr));
-                        return Err(InvalidData::new(&format!("Extraction failed for {}", filename), None));
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to run tar: {}", e);
-                        return Err(InvalidData::new(&format!("Extraction command failed: {}", e), None));
-                    }
-                }
-            } else {
-                // Copy file directly if not an archive
-                let dest_path = self.sourcedir.join(filename);
-                if let Err(e) = tokio::fs::copy(&file_path, &dest_path).await {
-                    return Err(InvalidData::new(&format!("Failed to copy {}: {}", filename, e), None));
-                }
-                println!("Copied: {}", filename);
-            }
-        }
-
-        Ok(())
+        // Use native Rust phase executor
+        let env = self.to_ebuild_env();
+        self.native_executor.src_unpack(&env)
     }
 
     async fn phase_prepare(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
         println!("Preparing sources for {}...", ebuild.cpv());
 
-        // Check if there's a custom src_prepare function
-        if let Some(executor) = &self.executor {
-            if executor.has_function("src_prepare") {
-                println!("Executing custom src_prepare function");
-                return executor.execute_function("src_prepare", self);
-            }
-        }
-
-        // Default src_prepare implementation
-        // In real implementation, this would apply patches, etc.
-        Ok(())
+        // Use native Rust phase executor
+        let env = self.to_ebuild_env();
+        self.native_executor.src_prepare(&env)
     }
 
     async fn phase_configure(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
-        use tokio::process::Command;
-
         println!("Configuring {}...", ebuild.cpv());
 
-        // Check if there's a custom src_configure function
-        if let Some(executor) = &self.executor {
-            if executor.has_function("src_configure") {
-                println!("Executing custom src_configure function");
-                return executor.execute_function("src_configure", self);
-            }
-        }
-
-        // Default src_configure implementation
-        // Check for common build systems and run appropriate configure command
-
-        let sourcedir = &self.sourcedir;
-
-        // Check if configure script exists (autotools)
-        let configure_path = sourcedir.join("configure");
-        if configure_path.exists() {
-            println!("Running ./configure...");
-            let output = Command::new("./configure")
-                .current_dir(sourcedir)
-                .output()
-                .await;
-
-            match output {
-                Ok(result) if result.status.success() => {
-                    println!("Configuration completed successfully");
-                    return Ok(());
-                }
-                Ok(result) => {
-                    eprintln!("Configuration failed: {}", String::from_utf8_lossy(&result.stderr));
-                    return Err(InvalidData::new("Configuration failed", None));
-                }
-                Err(e) => {
-                    eprintln!("Failed to run configure: {}", e);
-                    return Err(InvalidData::new(&format!("Configure command failed: {}", e), None));
-                }
-            }
-        }
-
-        // Check for CMakeLists.txt (CMake)
-        let cmake_path = sourcedir.join("CMakeLists.txt");
-        if cmake_path.exists() {
-            println!("Running cmake...");
-            let output = Command::new("cmake")
-                .arg(".")
-                .current_dir(sourcedir)
-                .output()
-                .await;
-
-            match output {
-                Ok(result) if result.status.success() => {
-                    println!("CMake configuration completed successfully");
-                    return Ok(());
-                }
-                Ok(result) => {
-                    eprintln!("CMake configuration failed: {}", String::from_utf8_lossy(&result.stderr));
-                    return Err(InvalidData::new("CMake configuration failed", None));
-                }
-                Err(e) => {
-                    eprintln!("Failed to run cmake: {}", e);
-                    return Err(InvalidData::new(&format!("CMake command failed: {}", e), None));
-                }
-            }
-        }
-
-        // Check for meson.build (Meson)
-        let meson_path = sourcedir.join("meson.build");
-        if meson_path.exists() {
-            println!("Running meson setup...");
-            let output = Command::new("meson")
-                .arg("setup")
-                .arg("build")
-                .current_dir(sourcedir)
-                .output()
-                .await;
-
-            match output {
-                Ok(result) if result.status.success() => {
-                    println!("Meson setup completed successfully");
-                    return Ok(());
-                }
-                Ok(result) => {
-                    eprintln!("Meson setup failed: {}", String::from_utf8_lossy(&result.stderr));
-                    return Err(InvalidData::new("Meson setup failed", None));
-                }
-                Err(e) => {
-                    eprintln!("Failed to run meson: {}", e);
-                    return Err(InvalidData::new(&format!("Meson command failed: {}", e), None));
-                }
-            }
-        }
-
-        // No known build system found, assume it's a simple build or pre-configured
-        println!("No configure script or build system detected, skipping configuration phase");
-        Ok(())
+        // Use native Rust phase executor
+        let env = self.to_ebuild_env();
+        self.native_executor.src_configure(&env)
     }
-
+    
     async fn phase_compile(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
-        use tokio::process::Command;
-
         println!("Compiling {}...", ebuild.cpv());
 
-        // Check if there's a custom src_compile function
-        if let Some(executor) = &self.executor {
-            if executor.has_function("src_compile") {
-                println!("Executing custom src_compile function");
-                return executor.execute_function("src_compile", self);
-            }
-        }
-
-        // Default src_compile implementation
-        // Check if this is the test hello package
-        if ebuild.package == "hello" && ebuild.category == "app-misc" {
-            // Special handling for test hello package
-            let hello_c = self.sourcedir.join("hello.c");
-            let hello_bin = self.sourcedir.join("hello");
-
-            // Create hello.c
-            let c_code = r#"#include <stdio.h>
-
-int main() {
-    printf("Hello, World from emerge-rs!\n");
-    return 0;
-}
-"#;
-            if let Err(e) = tokio::fs::write(&hello_c, c_code).await {
-                return Err(InvalidData::new(&format!("Failed to create hello.c: {}", e), None));
-            }
-
-            // Compile hello.c
-            let output = Command::new("gcc")
-                .arg("hello.c")
-                .arg("-o")
-                .arg("hello")
-                .current_dir(&self.sourcedir)
-                .output()
-                .await;
-
-            match output {
-                Ok(result) if result.status.success() => {
-                    println!("Compilation completed successfully");
-                    Ok(())
-                }
-                Ok(result) => {
-                    eprintln!("Compilation failed: {}", String::from_utf8_lossy(&result.stderr));
-                    Err(InvalidData::new("Compilation failed", None))
-                }
-                Err(e) => {
-                    eprintln!("Failed to run gcc: {}", e);
-                    Err(InvalidData::new(&format!("GCC command failed: {}", e), None))
-                }
-            }
-        } else {
-            // Default src_compile implementation
-            // Run make in the source directory
-            let output = Command::new("make")
-                .arg("-j")
-                .arg("4")  // Use 4 parallel jobs
-                .current_dir(&self.sourcedir)
-                .output()
-                .await;
-
-            match output {
-                Ok(result) if result.status.success() => {
-                    println!("Compilation completed successfully");
-                    Ok(())
-                }
-                Ok(result) => {
-                    eprintln!("Compilation failed: {}", String::from_utf8_lossy(&result.stderr));
-                    Err(InvalidData::new("Compilation failed", None))
-                }
-                Err(e) => {
-                    eprintln!("Failed to run make: {}", e);
-                    Err(InvalidData::new(&format!("Make command failed: {}", e), None))
-                }
-            }
-        }
+        // Use native Rust phase executor
+        let env = self.to_ebuild_env();
+        self.native_executor.src_compile(&env)
     }
-
+    
     async fn phase_test(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
         println!("Testing {}...", ebuild.cpv());
 
-        // Check if there's a custom src_test function
-        if let Some(executor) = &self.executor {
-            if executor.has_function("src_test") {
-                println!("Executing custom src_test function");
-                return executor.execute_function("src_test", self);
-            }
-        }
-
-        // Default src_test implementation
-        // In real implementation, this would run test suites
-        Ok(())
+        // Use native Rust phase executor
+        let env = self.to_ebuild_env();
+        self.native_executor.src_test(&env)
     }
-
+    
     async fn phase_install(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
-        use tokio::process::Command;
-
         println!("Installing {}...", ebuild.cpv());
 
-        // Check if there's a custom src_install function
-        if let Some(executor) = &self.executor {
-            if executor.has_function("src_install") {
-                println!("Executing custom src_install function");
-                return executor.execute_function("src_install", self);
-            }
-        }
-
-        // Default src_install implementation
-        // Check if this is the test hello package
-        if ebuild.package == "hello" && ebuild.category == "app-misc" {
-            // Special handling for test hello package
-            let hello_bin = self.sourcedir.join("hello");
-            let dest_bin = self.destdir.join("usr/bin");
-
-            // Create dest directory
-            if let Err(e) = tokio::fs::create_dir_all(&dest_bin).await {
-                return Err(InvalidData::new(&format!("Failed to create dest bin dir: {}", e), None));
-            }
-
-            // Copy hello binary
-            let dest_file = dest_bin.join("hello");
-            if let Err(e) = tokio::fs::copy(&hello_bin, &dest_file).await {
-                return Err(InvalidData::new(&format!("Failed to install hello binary: {}", e), None));
-            }
-
-            println!("Installation completed successfully");
-            Ok(())
-        } else {
-            // Default src_install implementation
-            // Run make install with DESTDIR
-            let output = Command::new("make")
-                .arg("install")
-                .env("DESTDIR", &self.destdir)
-                .current_dir(&self.sourcedir)
-                .output()
-                .await;
-
-            match output {
-                Ok(result) if result.status.success() => {
-                    println!("Installation completed successfully");
-                    Ok(())
-                }
-                Ok(result) => {
-                    eprintln!("Installation failed: {}", String::from_utf8_lossy(&result.stderr));
-                    Err(InvalidData::new("Installation failed", None))
-                }
-                Err(e) => {
-                    eprintln!("Failed to run make install: {}", e);
-                    Err(InvalidData::new(&format!("Make install command failed: {}", e), None))
-                }
-            }
-        }
+        let env = self.to_ebuild_env();
+        self.native_executor.src_install(&env)
     }
+    
+    async fn phase_merge(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
+        println!("Merging {} to filesystem...", ebuild.cpv());
 
+        let env = self.to_ebuild_env();
+        let root = std::env::var("ROOT").unwrap_or_else(|_| "/".to_string());
+        self.native_executor.merge(&env, &root)
+    }
+    
     async fn phase_package(&self, ebuild: &Ebuild) -> Result<(), InvalidData> {
         println!("Packaging {}...", ebuild.cpv());
 
@@ -944,16 +987,16 @@ int main() {
 }
 
 /// Set up build logging for a package
-fn setup_build_logging(ebuild: &Ebuild) -> Result<Option<std::fs::File>, InvalidData> {
+fn setup_build_logging(ebuild: &Ebuild, build_env: &BuildEnv) -> Result<Option<std::fs::File>, InvalidData> {
     use std::fs;
 
-    // Create log directory if it doesn't exist
-    let log_dir = Path::new("./var/log/portage");
-    fs::create_dir_all(log_dir)
-        .map_err(|e| InvalidData::new(&format!("Failed to create log directory: {}", e), None))?;
+    // Create log in $T (PORTAGE_BUILDDIR/temp) like Portage does
+    let temp_dir = build_env.workdir.join("temp");
+    fs::create_dir_all(&temp_dir)
+        .map_err(|e| InvalidData::new(&format!("Failed to create temp directory: {}", e), None))?;
 
-    // Create log file
-    let log_path = log_dir.join(format!("{}.log", ebuild.cpv().replace('/', "_")));
+    // Create log file - Portage uses build.log in $T  
+    let log_path = temp_dir.join("build.log");
     let log_file = fs::File::create(&log_path)
         .map_err(|e| InvalidData::new(&format!("Failed to create log file {}: {}", log_path.display(), e), None))?;
 
@@ -962,27 +1005,30 @@ fn setup_build_logging(ebuild: &Ebuild) -> Result<Option<std::fs::File>, Invalid
 }
 
 /// Main doebuild function to build a package from ebuild
-pub async fn doebuild(ebuild_path: &Path, phases: &[BuildPhase], use_flags: HashMap<String, bool>, features: Vec<String>) -> Result<BuildEnv, InvalidData> {
+pub async fn doebuild(ebuild_path: &Path, phases: &[BuildPhase], use_flags: HashMap<String, bool>, features: Vec<String>, portdir: &Path, distdir: &Path) -> Result<BuildEnv, InvalidData> {
     let ebuild = Ebuild::from_path_with_use(ebuild_path, &use_flags)?;
 
     println!("Building {} from {}", ebuild.cpv(), ebuild_path.display());
     println!("Ebuild metadata: {:?}", ebuild.metadata);
 
-    // Set up build logging
-    let mut log_file = setup_build_logging(&ebuild)?;
-
-    // Use test directories for now
-    let portdir = Path::new("./test-portage");
-    let distdir = Path::new("./test-distfiles");
-
     let mut build_env = BuildEnv::new(&ebuild, portdir, distdir, use_flags, features);
     println!("Build environment workdir: {}", build_env.workdir.display());
     println!("Build environment sourcedir: {}", build_env.sourcedir.display());
 
-    // Create ebuild executor
-    build_env.executor = Some(EbuildExecutor::from_ebuild(&ebuild.path)?);
+    // Create native phase executor based on INHERIT and EAPI
+    let eapi = crate::ebuild::Eapi::from_str(&ebuild.metadata.eapi)
+        .unwrap_or(crate::ebuild::Eapi::Eapi8);
+    build_env.native_executor = crate::ebuild::NativePhaseExecutor::with_eapi(
+        &ebuild.metadata.inherit,
+        &build_env.sourcedir,
+        eapi
+    );
 
+    // Setup directories first
     build_env.setup()?;
+    
+    // Set up build logging AFTER setup creates directories
+    let mut log_file = setup_build_logging(&ebuild, &build_env)?;
 
     // Log build start
     if let Some(ref mut log_file) = log_file {

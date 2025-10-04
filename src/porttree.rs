@@ -207,7 +207,7 @@ impl PortTree {
     }
 
     pub fn get_ebuild_path(&self, cpv: &str) -> Option<String> {
-        // Parse CPV to extract category/package/version
+        // Parse CPV: category/package-version
         let parts: Vec<&str> = cpv.split('/').collect();
         if parts.len() != 2 {
             return None;
@@ -247,7 +247,7 @@ impl PortTree {
         if let Some(ebuild_path) = self.get_ebuild_path(cpv) {
             if let Ok(content) = tokio::fs::read_to_string(&ebuild_path).await {
                 use crate::doebuild::Ebuild;
-                if let Ok(metadata) = Ebuild::parse_metadata_with_use(&content, &std::collections::HashMap::new()) {
+                if let Ok(metadata) = Ebuild::parse_metadata_with_use(&content, &std::collections::HashMap::new(), "", "", "") {
                     let mut meta = HashMap::new();
                     meta.insert("DESCRIPTION".to_string(), metadata.description.unwrap_or_default());
                     meta.insert("HOMEPAGE".to_string(), metadata.homepage.unwrap_or_default());
@@ -285,6 +285,29 @@ impl PortTree {
         if let Some(repo) = self.repositories.values_mut().next() {
             repo.metadata_cache.insert(cpv.to_string(), metadata);
         }
+    }
+
+    /// Check if a package exists (has any ebuilds) in the repositories
+    pub fn package_exists(&self, cp: &str) -> bool {
+        for repo in self.repositories.values() {
+            let repo_path = Path::new(&repo.location);
+            let pkg_path = repo_path.join(cp);
+            if pkg_path.exists() && pkg_path.is_dir() {
+                // Check if there are any .ebuild files
+                if let Ok(entries) = std::fs::read_dir(&pkg_path) {
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            if let Some(file_name) = entry.path().file_name().and_then(|n| n.to_str()) {
+                                if file_name.ends_with(".ebuild") {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Clear metadata cache

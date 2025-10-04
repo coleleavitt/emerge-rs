@@ -231,12 +231,41 @@ impl MaskManager {
         mask_files.push(config_mask_file);
 
         // Check each mask file in order (profile inheritance, then user config)
-        for mask_file in mask_files {
-            if mask_file.exists() {
-                let content = fs::read_to_string(&mask_file)
-                    .map_err(|e| InvalidData::new(&format!("Failed to read mask file {}: {}", mask_file.display(), e), None))?;
+        for mask_path in mask_files {
+            if mask_path.exists() {
+                let reason = if mask_path.is_dir() {
+                    self.check_mask_directory(&mask_path, atom, &mask_type)?
+                } else {
+                    let content = fs::read_to_string(&mask_path)
+                        .map_err(|e| InvalidData::new(&format!("Failed to read mask file {}: {}", mask_path.display(), e), None))?;
+                    self.check_mask_file_content(&content, atom, &mask_type)?
+                };
 
-                let reason = self.check_mask_file_content(&content, atom, &mask_type)?;
+                if reason.is_some() {
+                    return Ok(reason);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Check mask files in a directory for a given atom
+    fn check_mask_directory(&self, dir_path: &Path, atom: &Atom, mask_type: &MaskType) -> Result<Option<String>, InvalidData> {
+        let entries = fs::read_dir(dir_path)
+            .map_err(|e| InvalidData::new(&format!("Failed to read mask directory {}: {}", dir_path.display(), e), None))?;
+
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| InvalidData::new(&format!("Failed to read directory entry in {}: {}", dir_path.display(), e), None))?;
+            
+            let path = entry.path();
+            
+            if path.is_file() {
+                let content = fs::read_to_string(&path)
+                    .map_err(|e| InvalidData::new(&format!("Failed to read mask file {}: {}", path.display(), e), None))?;
+                
+                let reason = self.check_mask_file_content(&content, atom, mask_type)?;
                 if reason.is_some() {
                     return Ok(reason);
                 }
@@ -391,13 +420,32 @@ impl MaskManager {
             };
             mask_files.push(config_mask_file);
 
-            for mask_file in mask_files {
-                if mask_file.exists() {
-                    let content = fs::read_to_string(&mask_file)
-                        .map_err(|e| InvalidData::new(&format!("Failed to read mask file {}: {}", mask_file.display(), e), None))?;
+            for mask_path in mask_files {
+                if mask_path.exists() {
+                    if mask_path.is_dir() {
+                        let entries = fs::read_dir(&mask_path)
+                            .map_err(|e| InvalidData::new(&format!("Failed to read mask directory {}: {}", mask_path.display(), e), None))?;
 
-                    let file_rules = self.parse_mask_file(&content, mask_type.clone())?;
-                    rules.extend(file_rules);
+                        for entry in entries {
+                            let entry = entry
+                                .map_err(|e| InvalidData::new(&format!("Failed to read directory entry in {}: {}", mask_path.display(), e), None))?;
+                            
+                            let path = entry.path();
+                            if path.is_file() {
+                                let content = fs::read_to_string(&path)
+                                    .map_err(|e| InvalidData::new(&format!("Failed to read mask file {}: {}", path.display(), e), None))?;
+
+                                let file_rules = self.parse_mask_file(&content, mask_type.clone())?;
+                                rules.extend(file_rules);
+                            }
+                        }
+                    } else {
+                        let content = fs::read_to_string(&mask_path)
+                            .map_err(|e| InvalidData::new(&format!("Failed to read mask file {}: {}", mask_path.display(), e), None))?;
+
+                        let file_rules = self.parse_mask_file(&content, mask_type.clone())?;
+                        rules.extend(file_rules);
+                    }
                 }
             }
         }

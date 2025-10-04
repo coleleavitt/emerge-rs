@@ -107,12 +107,20 @@ fn create_app() -> Command {
 async fn run_emerge(matches: ArgMatches) -> i32 {
     let ask = matches.get_flag("ask");
     let pretend = matches.get_flag("pretend");
+    let verbose = matches.get_flag("verbose");
     let update = matches.get_flag("update");
     let deep = matches.get_flag("deep");
     let newuse = matches.get_flag("newuse");
     let resume = matches.get_flag("resume");
     let jobs = matches.get_one::<usize>("jobs").copied().unwrap_or(1);
     let with_bdeps = matches.get_one::<String>("with_bdeps").map(|s| s == "y").unwrap_or(false);
+    
+    // Set verbose mode globally if needed
+    if verbose {
+        unsafe {
+            std::env::set_var("EMERGE_VERBOSE", "1");
+        }
+    }
 
     if matches.get_flag("sync") {
         return actions::action_sync().await;

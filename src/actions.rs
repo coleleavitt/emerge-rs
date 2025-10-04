@@ -334,7 +334,18 @@ async fn get_package_dependencies(
     porttree: &PortTree,
     with_bdeps: bool,
 ) -> Result<(Vec<DepNode>, Vec<crate::dep::Atom>), Box<dyn std::error::Error + Send + Sync>> {
-    let cpv = format!("{}/{}", atom.cp(), atom.version.as_deref().unwrap_or("1.0"));
+    // If atom has a version, use it directly
+    let cpv = if let Some(version) = &atom.version {
+        format!("{}-{}", atom.cp(), version)
+    } else {
+        // For atoms without version, find the best available version
+        let merger = crate::merge::Merger::new("/");
+        match merger.find_best_version_with_porttree(&atom.cp(), Some(porttree)).await {
+            Ok(Some(best_cpv)) => best_cpv,
+            Ok(None) => return Err(format!("No version found for package: {}", atom.cp()).into()),
+            Err(e) => return Err(format!("Failed to find version for {}: {}", atom.cp(), e).into()),
+        }
+    };
 
     // First, try to get dependencies from binary package if available
     let bintree = crate::bintree::BinTree::new("/");
@@ -344,20 +355,19 @@ async fn get_package_dependencies(
     }
 
     // Fall back to ebuild-based dependency resolution
-    get_ebuild_dependencies(atom, porttree, with_bdeps).await
+    get_ebuild_dependencies(&cpv, porttree, with_bdeps).await
 }
 
 async fn get_ebuild_dependencies(
-    atom: &crate::atom::Atom,
+    cpv: &str,
     porttree: &PortTree,
     with_bdeps: bool,
 ) -> Result<(Vec<DepNode>, Vec<crate::dep::Atom>), Box<dyn std::error::Error + Send + Sync>> {
     // Use system portage tree
-    let cpv = format!("{}/{}", atom.cp(), atom.version.as_deref().unwrap_or("1.0"));
-    let ebuild_path = if let Some(path_str) = porttree.get_ebuild_path(&cpv) {
+    let ebuild_path = if let Some(path_str) = porttree.get_ebuild_path(cpv) {
         std::path::PathBuf::from(path_str)
     } else {
-        return Err(format!("Ebuild not found for {}", atom.cp()).into());
+        return Err(format!("Ebuild not found for {}", cpv).into());
     };
 
     if !ebuild_path.exists() {
@@ -365,7 +375,7 @@ async fn get_ebuild_dependencies(
     }
 
     let content = tokio::fs::read_to_string(&ebuild_path).await?;
-    let metadata = Ebuild::parse_metadata_with_use(&content, &std::collections::HashMap::new())?;
+    let metadata = Ebuild::parse_metadata_with_use(&content, &std::collections::HashMap::new(), "", "", "")?;
 
     let mut deps = Vec::new();
     let mut blockers = Vec::new();
@@ -666,22 +676,24 @@ pub async fn action_install_with_root(
 
             println!("Resolved packages to install: {:?}", result.resolved);
 
-            // Check if dependencies are satisfied
-            let mut checker = DepChecker::new(root);
-            match checker.check_dependencies(&atoms).await {
-                Ok(check_result) => {
-                    if !check_result.missing.is_empty() {
-                        eprintln!("Missing dependencies: {:?}", check_result.missing);
+            // Check if dependencies are satisfied (skip in pretend mode)
+            if !pretend_mode {
+                let mut checker = DepChecker::new(root);
+                match checker.check_dependencies(&atoms).await {
+                    Ok(check_result) => {
+                        if !check_result.missing.is_empty() {
+                            eprintln!("Missing dependencies: {:?}", check_result.missing);
+                            return 1;
+                        }
+                        if !check_result.conflicts.is_empty() {
+                            eprintln!("Conflicts: {:?}", check_result.conflicts);
+                            return 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Dependency check failed: {}", e);
                         return 1;
                     }
-                    if !check_result.conflicts.is_empty() {
-                        eprintln!("Conflicts: {:?}", check_result.conflicts);
-                        return 1;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Dependency check failed: {}", e);
-                    return 1;
                 }
             }
 
@@ -706,7 +718,7 @@ pub async fn action_install_with_root(
             }
 
             // Check for masked packages
-            let mask_manager = crate::mask::MaskManager::new("/", config.accept_keywords.clone());
+    let mask_manager = crate::mask::MaskManager::new("/", config.accept_keywords.clone());
             for cpv in &cpv_packages {
                 match Atom::new(cpv) {
                     Ok(atom) => {
@@ -1137,6 +1149,100 @@ pub async fn action_upgrade(packages: &[String], pretend: bool, ask: bool, deep:
         }
     };
 
+    // If newuse flag is set, check for packages with changed USE flags
+    if newuse && !resolved_packages.is_empty() {
+        let mut newuse_packages = Vec::new();
+        
+        // Check each package for USE flag changes
+        for pkg_cp in &resolved_packages {
+            // Get installed packages
+            let installed = vartree.get_all_installed().await.unwrap_or_default();
+            let pkg_cp_dash = pkg_cp.replace("/", "-");
+            
+            // Find installed version of this package
+            if let Some(installed_cpv) = installed.iter().find(|cpv| cpv.starts_with(&pkg_cp_dash)) {
+                // Read installed USE flags from package database
+                let pkg_db_path = std::path::Path::new("/var/db/pkg").join(installed_cpv);
+                let use_file = pkg_db_path.join("USE");
+                let iuse_file = pkg_db_path.join("IUSE");
+                
+                if use_file.exists() && iuse_file.exists() {
+                    if let (Ok(installed_use), Ok(iuse)) = (std::fs::read_to_string(&use_file), std::fs::read_to_string(&iuse_file)) {
+                        // Get installed USE flags (actual USE flags used during build)
+                        let installed_use_flags: std::collections::HashSet<String> = installed_use
+                            .split_whitespace()
+                            .filter(|s| !s.starts_with("abi_") && !s.starts_with("elibc_") && !s.starts_with("kernel_") && !s.starts_with("python_"))
+                            .map(|s| s.to_string())
+                            .collect();
+                        
+                        // Get available USE flags (IUSE - what the package supports)
+                        let available_use_flags: std::collections::HashSet<String> = iuse
+                            .split_whitespace()
+                            .map(|s| s.trim_start_matches('+').trim_start_matches('-'))
+                            .filter(|s| !s.starts_with("abi_") && !s.starts_with("elibc_") && !s.starts_with("kernel_") && !s.starts_with("python_") && !s.starts_with("verify-sig"))
+                            .map(|s| s.to_string())
+                            .collect();
+                        
+                        // Calculate what USE flags would be active now based on current config
+                        let mut current_effective_use: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        
+                        // Add global USE flags that this package supports
+                        for flag in &config.use_flags {
+                            if available_use_flags.contains(flag) {
+                                current_effective_use.insert(flag.clone());
+                            }
+                        }
+                        
+                        // Check package-specific USE flags if available
+                        if let Some(pkg_use) = config.package_use.get(pkg_cp) {
+                            for flag in pkg_use {
+                                let flag_name = flag.trim_start_matches('-');
+                                if flag.starts_with('-') {
+                                    current_effective_use.remove(flag_name);
+                                } else if available_use_flags.contains(flag_name) {
+                                    current_effective_use.insert(flag_name.to_string());
+                                }
+                            }
+                        }
+                        
+                        // Only compare the USE flags that the package actually uses (from IUSE)
+                        let installed_relevant: std::collections::HashSet<_> = installed_use_flags.intersection(&available_use_flags).collect();
+                        let current_relevant: std::collections::HashSet<_> = current_effective_use.intersection(&available_use_flags).collect();
+                        
+                        // Check if USE flags have changed
+                        if installed_relevant != current_relevant {
+                            // Get current version
+                            if let Ok(Some(available_cpv)) = merger.find_best_version_with_porttree(pkg_cp, Some(&porttree)).await {
+                                if let Some(last_dash) = installed_cpv.rfind('-') {
+                                    let installed_version = &installed_cpv[last_dash + 1..];
+                                    if let Some(last_dash) = available_cpv.rfind('-') {
+                                        let available_version = &available_cpv[last_dash + 1..];
+                                        
+                                        // Add to rebuild list (even if same version, due to USE change)
+                                        newuse_packages.push((
+                                            pkg_cp.clone(),
+                                            installed_version.to_string(),
+                                            format!("{} (USE changed)", available_version),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if !newuse_packages.is_empty() {
+            println!("\nPackages with changed USE flags ({} packages):", newuse_packages.len());
+            for (cp, _inst, _avail) in &newuse_packages {
+                println!("  {}", cp);
+            }
+        }
+        
+        packages_to_upgrade.extend(newuse_packages);
+    }
+    
     // If deep flag is set, also check dependencies for updates
     if deep && !packages_to_upgrade.is_empty() {
         let mut additional_packages = Vec::new();
@@ -1219,9 +1325,20 @@ pub async fn action_upgrade(packages: &[String], pretend: bool, ask: bool, deep:
     }
 
     if ask {
-        println!("Would you like to proceed? (y/N)");
-        // Placeholder: in real implementation, read user input
-        println!("Proceeding with upgrade...");
+        println!("\nWould you like to proceed? (y/N) ");
+        use std::io::{self, BufRead};
+        let stdin = io::stdin();
+        let mut response = String::new();
+        if let Ok(_) = stdin.lock().read_line(&mut response) {
+            let response = response.trim().to_lowercase();
+            if response != "y" && response != "yes" {
+                println!("Cancelled by user.");
+                return 0;
+            }
+        } else {
+            println!("Failed to read input, aborting.");
+            return 1;
+        }
     }
 
     // Perform the upgrades
@@ -1670,8 +1787,8 @@ async fn get_specific_upgradable_packages(
                         let cp = atom.cp();
 
                         // Check if package is masked
-                        if let Some(mask_reason) = mask_manager.is_masked(&atom).await? {
-                            eprintln!("{} is masked: {}", cp, mask_reason);
+                        if let Some(_mask_reason) = mask_manager.is_masked(&atom).await? {
+                            // Package is masked, skip it
                             continue;
                         }
 
@@ -1705,8 +1822,8 @@ async fn get_specific_upgradable_packages(
                                     blocker: None,
                                 };
 
-                                if let Some(mask_reason) = mask_manager.is_masked(&available_atom).await? {
-                                    eprintln!("Available version {} is masked: {}", available_cpv, mask_reason);
+                                if let Some(_mask_reason) = mask_manager.is_masked(&available_atom).await? {
+                                    // Version is masked, skip it
                                     continue;
                                 }
 
@@ -1730,7 +1847,7 @@ async fn get_specific_upgradable_packages(
                                     }
                                 }
                             } else {
-                                eprintln!("No available version found for {}", cp);
+                                eprintln!("No available version found for {} (may be masked or ~arch)", cp);
                             }
                         } else {
                             eprintln!("{} is not installed.", cp);

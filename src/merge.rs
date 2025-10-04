@@ -64,8 +64,8 @@ impl Merger {
 
         // Check PortTree for ebuild versions
         if let Some(porttree) = porttree {
-            if let Some(best_version) = self.find_best_ebuild_version(cp, porttree).await? {
-                return Ok(Some(best_version));
+            if let Some(best_cpv) = self.find_best_ebuild_version(cp, porttree).await? {
+                return Ok(Some(best_cpv));
             }
         }
 
@@ -74,7 +74,7 @@ impl Merger {
 
     /// Find the best ebuild version from PortTree
     async fn find_best_ebuild_version(&self, cp: &str, porttree: &PortTree) -> Result<Option<String>, InvalidData> {
-        let mut best_version: Option<String> = None;
+        let mut best_cpv: Option<String> = None;
         let mut best_cmp = i32::MIN;
 
         // Split cp into category and package
@@ -102,24 +102,49 @@ impl Merger {
                 while let Some(entry) = entries.next_entry().await.transpose() {
                     let entry = match entry {
                         Ok(e) => e,
-                        Err(_) => continue, // Skip entries we can't read
+                        Err(_) => continue,
                     };
                     let path = entry.path();
                     if let Some(ext) = path.extension() {
                         if ext == "ebuild" {
                             if let Some(filename) = path.file_stem() {
                                 let filename_str = filename.to_string_lossy();
+                                
+                                // Parse the full CPV using pkgsplit to properly extract version
+                                let cpv = format!("{}/{}", category, filename_str);
+                                if let Some((_, ver, rev)) = crate::versions::pkgsplit(&cpv) {
+                                    // Skip live ebuilds (9999, 99999999, etc.) unless no other version exists
+                                    if ver.contains("9999") {
+                                        continue;
+                                    }
 
-                                // Extract version from filename (package-version format)
-                                if let Some(last_dash) = filename_str.rfind('-') {
-                                    let version = &filename_str[last_dash + 1..];
+                                    // Reconstruct the full version string (with revision if not r0)
+                                    let full_version = if rev == "r0" {
+                                        ver.clone()
+                                    } else {
+                                        format!("{}-{}", ver, rev)
+                                    };
 
                                     // Compare versions
-                                    if let Some(cmp) = crate::versions::vercmp(version, best_version.as_deref().unwrap_or("")) {
-                                        if cmp > best_cmp {
-                                            best_version = Some(version.to_string());
-                                            best_cmp = cmp;
+                                    if let Some(current_best) = &best_cpv {
+                                        // Extract version from current best
+                                        if let Some((_, best_ver, best_rev)) = crate::versions::pkgsplit(current_best) {
+                                            let best_full_version = if best_rev == "r0" {
+                                                best_ver
+                                            } else {
+                                                format!("{}-{}", best_ver, best_rev)
+                                            };
+                                            if let Some(cmp) = crate::versions::vercmp(&full_version, &best_full_version) {
+                                                if cmp > 0 {
+                                                    best_cpv = Some(cpv);
+                                                    best_cmp = cmp;
+                                                }
+                                            }
                                         }
+                                    } else {
+                                        // First valid version found
+                                        best_cpv = Some(cpv);
+                                        best_cmp = 0;
                                     }
                                 }
                             }
@@ -129,7 +154,7 @@ impl Merger {
             }
         }
 
-        Ok(best_version)
+        Ok(best_cpv)
     }
 
     /// Get the path to the resume state file
@@ -140,16 +165,25 @@ impl Merger {
     /// Save resume state
     async fn save_resume_state(&self, state: &ResumeState) -> Result<(), InvalidData> {
         let state_path = self.resume_state_path();
-        tokio::fs::create_dir_all(state_path.parent().unwrap())
-            .await
-            .map_err(|e| InvalidData::new(&format!("Failed to create state directory: {}", e), None))?;
+        
+        // Create directory if needed
+        if let Err(e) = tokio::fs::create_dir_all(state_path.parent().unwrap()).await {
+            eprintln!("Warning: Failed to create state directory: {}", e);
+            return Ok(()); // Don't fail the entire operation
+        }
 
-        let json = serde_json::to_string_pretty(state)
-            .map_err(|e| InvalidData::new(&format!("Failed to serialize state: {}", e), None))?;
+        let json = match serde_json::to_string_pretty(state) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("Warning: Failed to serialize state: {}", e);
+                return Ok(()); // Don't fail the entire operation
+            }
+        };
 
-        tokio::fs::write(&state_path, json)
-            .await
-            .map_err(|e| InvalidData::new(&format!("Failed to write state file: {}", e), None))?;
+        if let Err(e) = tokio::fs::write(&state_path, json).await {
+            eprintln!("Warning: Failed to write state file: {}", e);
+            // Don't fail the entire operation if we can't save resume state
+        }
 
         Ok(())
     }
@@ -175,9 +209,9 @@ impl Merger {
     async fn clear_resume_state(&self) -> Result<(), InvalidData> {
         let state_path = self.resume_state_path();
         if state_path.exists() {
-            tokio::fs::remove_file(&state_path)
-                .await
-                .map_err(|e| InvalidData::new(&format!("Failed to remove state file: {}", e), None))?;
+            if let Err(e) = tokio::fs::remove_file(&state_path).await {
+                eprintln!("Warning: Failed to remove resume state file: {}", e);
+            }
         }
         Ok(())
     }
@@ -340,44 +374,52 @@ impl Merger {
         // Fall back to building from source
         println!("No binary package available, building from source");
 
+        // Load PortTree to find ebuild
+        let mut porttree = PortTree::new("/");
+        porttree.scan_repositories();
+
         // Find ebuild file
-        let ebuild_path = self.find_ebuild(&pkg)?;
+        let ebuild_path = self.find_ebuild_with_porttree(&pkg, Some(&porttree))?;
         println!("Looking for ebuild at: {}", ebuild_path.display());
         if !ebuild_path.exists() {
             return Err(InvalidData::new(&format!("Ebuild not found: {}", ebuild_path.display()), None));
         }
         println!("Found ebuild: {}", ebuild_path.display());
 
-        // Build phases to execute
         let phases = vec![
             BuildPhase::Setup,
+            BuildPhase::Fetch,
             BuildPhase::Unpack,
             BuildPhase::Prepare,
             BuildPhase::Configure,
             BuildPhase::Compile,
             BuildPhase::Test,
             BuildPhase::Install,
+            BuildPhase::Merge,
         ];
 
         // USE flags from config
         let config = crate::config::Config::new("/").await?;
         let use_flags = config.get_use_flags_map();
 
+        // Determine portdir and distdir
+        let portdir = Path::new("/var/db/repos/gentoo"); // Main gentoo repo
+        let distdir = Path::new("/var/cache/distfiles");
+
         // Execute build
-        let build_env = doebuild(&ebuild_path, &phases, use_flags, config.features.clone()).await?;
+        let build_env = doebuild(&ebuild_path, &phases, use_flags, config.features.clone(), portdir, distdir).await?;
 
         // Copy installed files from build destdir to root filesystem
         self.copy_files_to_root(&build_env.destdir, &self.root).await?;
 
-        // Create package directory (use temp dir for testing)
-        let temp_dir = std::env::temp_dir();
-        let pkg_dir = temp_dir.join("emerge-rs-db").join(cpv);
-        if let Err(e) = fs::create_dir_all(&pkg_dir).await {
+        // Create package directory in /var/db/pkg
+        let pkg_db_dir = Path::new(&self.root).join("var/db/pkg").join(&pkg.cpv_split[0]).join(format!("{}-{}", &pkg.cpv_split[1], &pkg.version));
+        if let Err(e) = fs::create_dir_all(&pkg_db_dir).await {
             return Err(InvalidData::new(&format!("Failed to create package directory: {}", e), None));
         }
 
         // Update package database
-        self.update_package_db(&pkg_dir, &pkg, &ebuild_path, Some(&build_env)).await?;
+        self.update_package_db(&pkg_db_dir, &pkg, &ebuild_path, Some(&build_env)).await?;
 
         // Clean up build environment
         if let Err(e) = tokio::fs::remove_dir_all(&build_env.workdir).await {
@@ -389,25 +431,50 @@ impl Merger {
     }
 
     fn find_ebuild(&self, pkg: &PkgStr) -> Result<std::path::PathBuf, InvalidData> {
-        // Try test portage directory first, then system portage
-        let test_portdir = Path::new("./test-portage");
-        let ebuild_path = test_portdir
-            .join(&pkg.cpv_split[0])  // category
-            .join(&pkg.cpv_split[1])  // package
-            .join(format!("{}-{}.ebuild", pkg.cpv_split[1], pkg.version));
+        self.find_ebuild_with_porttree(pkg, None)
+    }
 
-        if ebuild_path.exists() {
-            return Ok(ebuild_path);
+    fn find_ebuild_with_porttree(&self, pkg: &PkgStr, porttree: Option<&PortTree>) -> Result<std::path::PathBuf, InvalidData> {
+        // Parse CPV to extract category/package/version
+        let category = &pkg.cpv_split[0];
+        let package = &pkg.cpv_split[1];
+        
+        // Reconstruct version with revision
+        let version_str = &pkg.version;
+
+        // If PortTree is provided, use it to search repositories
+        if let Some(tree) = porttree {
+            for repo in tree.repositories.values() {
+                let ebuild_path = Path::new(&repo.location)
+                    .join(category)
+                    .join(package)
+                    .join(format!("{}-{}.ebuild", package, version_str));
+
+                if ebuild_path.exists() {
+                    return Ok(ebuild_path);
+                }
+            }
         }
 
-        // Fall back to system portage
-        let portdir = Path::new("/usr/portage");
-        let system_ebuild_path = portdir
-            .join(&pkg.cpv_split[0])  // category
-            .join(&pkg.cpv_split[1])  // package
-            .join(format!("{}-{}.ebuild", pkg.cpv_split[1], pkg.version));
+        // Try common locations as fallback
+        let locations = vec![
+            "/var/db/repos/gentoo",
+            "/usr/portage",
+            "./test-portage",
+        ];
 
-        Ok(system_ebuild_path)
+        for location in locations {
+            let ebuild_path = Path::new(location)
+                .join(category)
+                .join(package)
+                .join(format!("{}-{}.ebuild", package, version_str));
+
+            if ebuild_path.exists() {
+                return Ok(ebuild_path);
+            }
+        }
+
+        Err(InvalidData::new(&format!("Ebuild not found for {}", pkg.cpv), None))
     }
 
     async fn install_binary_package(&self, cpv: &str, pretend: bool) -> Result<(), InvalidData> {
@@ -598,6 +665,49 @@ impl Merger {
             if let Err(e) = fs::write(pkg_dir.join("LICENSE"), format!("{}\n", license)).await {
                 return Err(InvalidData::new(&format!("Failed to write LICENSE: {}", e), None));
             }
+        }
+
+        // Write EAPI
+        if let Err(e) = fs::write(pkg_dir.join("EAPI"), format!("{}\n", ebuild.metadata.eapi)).await {
+            return Err(InvalidData::new(&format!("Failed to write EAPI: {}", e), None));
+        }
+
+        // Write BUILD_TIME
+        let build_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Err(e) = fs::write(pkg_dir.join("BUILD_TIME"), format!("{}\n", build_time)).await {
+            return Err(InvalidData::new(&format!("Failed to write BUILD_TIME: {}", e), None));
+        }
+
+        // Write KEYWORDS
+        if !ebuild.metadata.keywords.is_empty() {
+            let keywords = ebuild.metadata.keywords.join(" ");
+            if let Err(e) = fs::write(pkg_dir.join("KEYWORDS"), format!("{}\n", keywords)).await {
+                return Err(InvalidData::new(&format!("Failed to write KEYWORDS: {}", e), None));
+            }
+        }
+
+        // Write IUSE
+        if !ebuild.metadata.iuse.is_empty() {
+            let iuse = ebuild.metadata.iuse.join(" ");
+            if let Err(e) = fs::write(pkg_dir.join("IUSE"), format!("{}\n", iuse)).await {
+                return Err(InvalidData::new(&format!("Failed to write IUSE: {}", e), None));
+            }
+        }
+
+        // Write INHERITED
+        if !ebuild.metadata.inherit.is_empty() {
+            let inherited = ebuild.metadata.inherit.join(" ");
+            if let Err(e) = fs::write(pkg_dir.join("INHERITED"), format!("{}\n", inherited)).await {
+                return Err(InvalidData::new(&format!("Failed to write INHERITED: {}", e), None));
+            }
+        }
+
+        // Copy ebuild file
+        if let Err(e) = fs::copy(ebuild_path, pkg_dir.join(ebuild_path.file_name().unwrap())).await {
+            eprintln!("Warning: Failed to copy ebuild: {}", e);
         }
 
         // Create CONTENTS file
@@ -810,14 +920,18 @@ impl Merger {
 
         // Add directories first
         for dir in dirs {
-            contents.push_str(&format!("dir {}\n", dir));
+            contents.push_str(&format!("dir /{}\n", dir));
         }
 
         // Add objects
         for (path, size) in objs {
             // Generate a placeholder hash - in real implementation, this would be MD5
             let hash = format!("{:032x}", size.wrapping_mul(0x123456789ABCDEF));
-            contents.push_str(&format!("obj {} {} {}\n", path, hash, size));
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            contents.push_str(&format!("obj /{} {} {}\n", path, hash, timestamp));
         }
 
         Ok(contents)

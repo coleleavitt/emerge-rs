@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 regex = "1"
 lazy_static = "1.4"
-phf = { version = "0.11", features = ["macros"] }
-quick-xml = "0.31"
+phf = { version = "0.13.1", features = ["macros"] }
+quick-xml = "0.38.3"
 clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -15,10 +15,18 @@ async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0.17"
 log = "0.4"
-env_logger = "0.10"
-nix = { version = "0.27", features = ["user"] }
+env_logger = "0.11.8"
+nix = { version = "0.30.1", features = ["user"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.0"
 pathdiff = "0.2"
+colored = "3.0.0"
+num_cpus = "1.0"
+tar = "0.4"
+flate2 = "1.0"
+bzip2 = "0.6.0"
+xz2 = "0.1"
+zstd = "0.13"
+zip = "5.1.1"

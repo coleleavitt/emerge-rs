@@ -21,10 +21,12 @@ pub struct DepChecker {
 
 impl DepChecker {
     pub fn new(root: &str) -> Self {
+        let mut porttree = PortTree::new(root);
+        porttree.scan_repositories();
         DepChecker {
             vartree: VarTree::new(root),
             bintree: BinTree::new(root),
-            porttree: PortTree::new(root),
+            porttree,
         }
     }
 
@@ -65,9 +67,8 @@ impl DepChecker {
             }
         }
 
-        // Check available ebuilds (simplified - would need to scan ebuilds)
-        // For now, assume if it's in porttree metadata, it's available
-        if let Some(_) = self.porttree.get_metadata(&atom.cp()).await {
+        // Check if package exists in porttree
+        if self.porttree.package_exists(&atom.cp()) {
             return Ok(true);
         }
 

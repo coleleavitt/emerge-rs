@@ -141,20 +141,54 @@ impl ProfileManager {
     }
 
     /// Load all settings from a profile and its inheritance chain
-    pub async fn load_profile_settings(&self, profile: &Profile) -> Result<ProfileSettings, InvalidData> {
-        let mut settings = ProfileSettings::default();
+    pub fn load_profile_settings<'a>(&'a self, profile: &'a Profile) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProfileSettings, InvalidData>> + 'a + Send>> {
+        Box::pin(async move {
+            let mut settings = ProfileSettings::default();
 
-        // Load settings from parent profiles first (lower precedence)
-        for parent in &profile.parent_profiles {
-            let parent_settings = self.load_single_profile_settings(&parent.path).await?;
-            self.merge_settings(&mut settings, &parent_settings);
+            // Load settings from parent profiles first (lower precedence) - recursively!
+            for parent in &profile.parent_profiles {
+                let parent_settings = self.load_profile_settings(parent).await?;
+                self.merge_settings(&mut settings, &parent_settings);
+            }
+
+            // Load settings from current profile (higher precedence)
+            let current_settings = self.load_single_profile_settings(&profile.path).await?;
+            self.merge_settings(&mut settings, &current_settings);
+
+            // Expand variables after all profiles are merged
+            self.expand_variables(&mut settings);
+
+            Ok(settings)
+        })
+    }
+
+    /// Expand variable references in profile settings
+    fn expand_variables(&self, settings: &mut ProfileSettings) {
+        // Create a map for variable lookups
+        let vars = settings.variables.clone();
+        
+        // Expand variables in all variable values
+        for (_key, value) in settings.variables.iter_mut() {
+            *value = self.expand_string(value, &vars);
         }
+    }
 
-        // Load settings from current profile (higher precedence)
-        let current_settings = self.load_single_profile_settings(&profile.path).await?;
-        self.merge_settings(&mut settings, &current_settings);
-
-        Ok(settings)
+    /// Expand variable references in a string
+    fn expand_string(&self, s: &str, vars: &HashMap<String, String>) -> String {
+        let mut result = s.to_string();
+        
+        // Simple variable expansion for ${VAR} and $VAR patterns
+        for (var_name, var_value) in vars {
+            // Expand ${VAR}
+            let pattern1 = format!("${{{}}}", var_name);
+            result = result.replace(&pattern1, var_value);
+            
+            // Expand $VAR (but only if not followed by valid var name chars)
+            let pattern2 = format!("${}", var_name);
+            result = result.replace(&pattern2, var_value);
+        }
+        
+        result
     }
 
     /// Load settings from a single profile directory

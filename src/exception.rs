@@ -69,6 +69,12 @@ impl fmt::Display for InvalidData {
 
 impl Error for InvalidData {}
 
+impl From<std::io::Error> for InvalidData {
+    fn from(err: std::io::Error) -> Self {
+        InvalidData::new(&format!("IO error: {}", err), None)
+    }
+}
+
 // Similarly for others, but for brevity, define the main ones used in versions.rs
 #[derive(Debug)]
 pub struct InvalidAtom {
