@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::atom::Atom;
 use crate::exception::InvalidData;
 use crate::dep::dep_satisfied_with_use;
+use crate::porttree::PortTree;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DepType {
@@ -38,6 +39,13 @@ pub struct ResolutionResult {
     pub circular: Vec<String>,
     pub backtrack_count: usize,
     pub resolution_time_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+struct BacktrackState {
+    assignments: HashMap<String, String>, // cp -> cpv
+    conflicts: HashSet<String>, // packages that caused conflicts
+    depth: usize,
 }
 
 impl DepGraph {
@@ -107,69 +115,163 @@ impl DepGraph {
 
 
 
-    pub fn resolve(&self, targets: &[String]) -> Result<ResolutionResult, InvalidData> {
-        self.resolve_with_backtracking(targets)
+    pub async fn resolve(&self, targets: &[String], porttree: &mut PortTree) -> Result<ResolutionResult, InvalidData> {
+        self.resolve_with_backtracking(targets, porttree).await
     }
-    
-    pub fn resolve_with_backtracking(&self, targets: &[String]) -> Result<ResolutionResult, InvalidData> {
+
+    pub async fn resolve_with_backtracking(&self, targets: &[String], porttree: &mut PortTree) -> Result<ResolutionResult, InvalidData> {
         let start_time = std::time::Instant::now();
+
         let mut backtrack_count = 0;
+        let initial_state = BacktrackState {
+            assignments: HashMap::new(),
+            conflicts: HashSet::new(),
+            depth: 0,
+        };
 
-        loop {
-            match self.resolve_advanced(targets) {
-                Ok(result) => {
-                    if result.blocked.is_empty() && result.circular.is_empty() {
-                        let elapsed = start_time.elapsed().as_millis();
-                        return Ok(ResolutionResult {
-                            resolved: result.resolved,
-                            blocked: result.blocked,
-                            circular: result.circular,
-                            backtrack_count,
-                            resolution_time_ms: elapsed,
-                        });
-                    }
+        match self.backtrack_resolve(targets, porttree, initial_state, &mut backtrack_count).await {
+            Ok(assignments) => {
+                let elapsed = start_time.elapsed();
+                let elapsed_ms = elapsed.as_millis() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000.0;
 
-                    if backtrack_count >= self.backtrack_limit {
-                        let elapsed = start_time.elapsed().as_millis();
-                        if !result.blocked.is_empty() {
-                            return Err(InvalidData::new(
-                                &format!("Cannot resolve dependencies after {} backtrack attempts. Blocked packages: {:?}",
-                                         backtrack_count, result.blocked),
-                                None
-                            ));
-                        }
-                        if !result.circular.is_empty() {
-                            return Err(InvalidData::new(
-                                &format!("Circular dependencies detected: {:?}", result.circular),
-                                None
-                            ));
-                        }
-                        return Ok(ResolutionResult {
-                            resolved: result.resolved,
-                            blocked: result.blocked,
-                            circular: result.circular,
-                            backtrack_count,
-                            resolution_time_ms: elapsed,
-                        });
-                    }
+                // Convert assignments to resolved list
+                let resolved: Vec<String> = assignments.values().cloned().collect();
 
-                    backtrack_count += 1;
-                }
-                Err(e) => {
-                    if backtrack_count >= self.backtrack_limit {
-                        return Err(e);
-                    }
-                    backtrack_count += 1;
-                }
+                Ok(ResolutionResult {
+                    resolved,
+                    blocked: vec![],
+                    circular: vec![],
+                    backtrack_count,
+                    resolution_time_ms: (elapsed_ms * 1000.0) as u128, // Store as microseconds
+                })
             }
+            Err(e) => Err(e)
         }
     }
 
+    async fn backtrack_resolve(&self, targets: &[String], porttree: &mut PortTree, mut state: BacktrackState, backtrack_count: &mut usize) -> Result<HashMap<String, String>, InvalidData> {
+        // If we've processed all targets, check for conflicts
+        if state.depth >= targets.len() {
+            return self.check_final_conflicts(&state.assignments, porttree).await;
+        }
+
+        let current_target = &targets[state.depth];
+        let cp = if current_target.contains('/') {
+            current_target.clone()
+        } else {
+            // Assume it's a package name, try to find it
+            // For now, just use as-is
+            current_target.clone()
+        };
+
+        // Get available versions for this package
+        let versions = porttree.get_package_versions(&cp);
+        if versions.is_empty() {
+            // Skip packages with no available versions
+            state.depth += 1;
+            return Box::pin(self.backtrack_resolve(targets, porttree, state, backtrack_count)).await;
+        }
+
+        // Sort versions (prefer higher versions)
+        let mut sorted_versions = versions;
+        sorted_versions.sort_by(|a, b| {
+            // Simple version comparison - in real implementation, use proper version comparison
+            b.cmp(a)
+        });
+
+        for version in sorted_versions {
+            *backtrack_count += 1;
+
+            // Try assigning this version
+            if self.can_assign(&cp, &version, &state.assignments, porttree).await? {
+                state.assignments.insert(cp.clone(), version.clone());
+
+                // Recurse to next target
+                state.depth += 1;
+                match Box::pin(self.backtrack_resolve(targets, porttree, state.clone(), backtrack_count)).await {
+                    Ok(result) => return Ok(result),
+                    Err(_) => {
+                        // Conflict, try next version
+                        state.depth -= 1;
+                        state.assignments.remove(&cp);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // No version worked
+        Err(InvalidData::new(&format!("No suitable version found for {}", cp), None))
+    }
+
+    async fn can_assign(&self, cp: &str, cpv: &str, assignments: &HashMap<String, String>, porttree: &mut PortTree) -> Result<bool, InvalidData> {
+        // Check blockers
+        if let Some(node) = self.nodes.get(cp) {
+            for blocker in &node.blockers {
+                for (_, assigned_cpv) in assignments {
+                    if blocker.matches(assigned_cpv) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn check_final_conflicts(&self, assignments: &HashMap<String, String>, porttree: &mut PortTree) -> Result<HashMap<String, String>, InvalidData> {
+        // Check all dependencies are satisfied
+        for (cp, cpv) in assignments {
+            if let Some(metadata) = porttree.get_metadata(cpv).await {
+                // Check runtime dependencies
+                if let Some(depend_str) = metadata.get("DEPEND") {
+                    if let Ok(deps) = crate::dep::parse_dependencies(depend_str) {
+                        for dep_atom in deps {
+                            let dep_cp = dep_atom.cp();
+                            if !assignments.contains_key(&dep_cp) {
+                                return Err(InvalidData::new(&format!("Unsatisfied dependency {} for {}", dep_cp, cpv), None));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(assignments.clone())
+    }
+
+
+
     /// Advanced dependency resolution with SLOT and version conflict handling
     pub fn resolve_advanced(&self, targets: &[String]) -> Result<ResolutionResult, InvalidData> {
+        let start_time = std::time::Instant::now();
         let mut resolved: HashMap<String, String> = HashMap::new(); // cp:slot -> cpv
         let mut blocked: Vec<String> = Vec::new();
-        let mut to_process: VecDeque<String> = targets.iter().cloned().collect();
+        let mut to_process: VecDeque<String> = VecDeque::new();
+
+        // Convert CP targets to CPV targets by finding them in the graph
+        for target in targets {
+            // If target is already a CPV (contains version), use it directly
+            if target.split('-').count() >= 3 {
+                to_process.push_back(target.clone());
+            } else {
+                // Target is a CP, find the corresponding CPV in the graph
+                let mut found = false;
+                for node_key in self.nodes.keys() {
+                    if node_key.starts_with(&format!("{}-", target)) {
+                        to_process.push_back(node_key.clone());
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    // If not found in graph, add the CP anyway - it might get resolved later
+                    to_process.push_back(target.clone());
+                }
+            }
+        }
+
+        eprintln!("DEBUG: Starting resolution with {} targets, graph has {} nodes", to_process.len(), self.nodes.len());
         let mut visited = HashSet::new();
 
         while let Some(current) = to_process.pop_front() {
@@ -288,14 +390,20 @@ impl DepGraph {
         let circular = self.detect_cycles();
 
         // Convert resolved map back to vec
-        let resolved_vec = resolved.values().cloned().collect();
+        let resolved_vec: Vec<String> = resolved.values().cloned().collect();
+
+        let elapsed = start_time.elapsed();
+        let elapsed_ms = elapsed.as_millis() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000.0;
+
+        eprintln!("DEBUG: Resolution completed in {:.3} ms, found {} resolved packages, {} blocked, {} circular",
+                 elapsed_ms, resolved_vec.len(), blocked.len(), circular.len());
 
         Ok(ResolutionResult {
             resolved: resolved_vec,
             blocked,
             circular,
             backtrack_count: 0,
-            resolution_time_ms: 0,
+            resolution_time_ms: elapsed_ms as u128,
         })
     }
 
@@ -330,8 +438,8 @@ impl DepGraph {
         rec_stack.remove(node);
     }
 
-    pub fn get_install_order(&self, targets: &[String]) -> Result<Vec<String>, InvalidData> {
-        let resolution = self.resolve(targets)?;
+    pub async fn get_install_order(&self, targets: &[String], porttree: &mut PortTree) -> Result<Vec<String>, InvalidData> {
+        let resolution = self.resolve(targets, porttree).await?;
 
         if !resolution.blocked.is_empty() {
             return Err(InvalidData::new(&format!("Blocked packages: {:?}", resolution.blocked), None));

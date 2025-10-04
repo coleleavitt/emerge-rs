@@ -525,6 +525,39 @@ impl PortTree {
         self.repositories.get(repo_name).map(|r| &r.sync_metadata)
     }
 
+    /// Get all available versions for a package (CP)
+    pub fn get_package_versions(&self, cp: &str) -> Vec<String> {
+        let mut versions = Vec::new();
+
+        for repo in self.repositories.values() {
+            let repo_path = Path::new(&repo.location);
+            let pkg_path = repo_path.join(cp);
+
+            if pkg_path.exists() && pkg_path.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&pkg_path) {
+                    for entry in entries.flatten() {
+                        if let Some(file_name) = entry.path().file_name().and_then(|n| n.to_str()) {
+                            if file_name.ends_with(".ebuild") {
+                                // Extract version from filename (package-version.ebuild)
+                                if let Some(version_start) = file_name.find('-') {
+                                    if let Some(version_end) = file_name.rfind('.') {
+                                        let version = &file_name[version_start + 1..version_end];
+                                        let cpv = format!("{}-{}", cp, version);
+                                        if !versions.contains(&cpv) {
+                                            versions.push(cpv);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        versions
+    }
+
     /// Check if a repository needs syncing (based on auto-sync and time since last sync)
     pub fn needs_sync(&self, repo_name: &str) -> bool {
         if let Some(repo) = self.repositories.get(repo_name) {
