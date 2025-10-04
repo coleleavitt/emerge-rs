@@ -1,0 +1,12 @@
+/target
+debug/
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+rust-project.json
+test-portage/
+test-distfiles/
+portage/
+.sync_metadata
+README.md

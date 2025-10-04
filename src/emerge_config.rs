@@ -1,0 +1,1 @@
+// emerge_config.rs - Emerge configuration handling
