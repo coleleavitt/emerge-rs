@@ -9,6 +9,24 @@ use crate::sets;
 use crate::sync::controller::sync_repository;
 use std::path::Path;
 
+#[derive(Debug, Clone)]
+enum PackageStatus {
+    New,
+    Upgrade,
+    Rebuild,
+    Downgrade,
+}
+
+#[derive(Debug, Clone)]
+struct MergePlanItem {
+    cpv: String,
+    status: PackageStatus,
+    old_version: Option<String>,
+    slot: Option<String>,
+    size: Option<u64>,
+    use_changes: Vec<(String, bool)>,
+}
+
 pub async fn action_sync() -> i32 {
     use tokio_stream::StreamExt;
 
@@ -278,6 +296,234 @@ auto-sync = true
     }
 }
 
+async fn get_download_size(src_uri: &str, distdir: &str) -> Option<u64> {
+    // Extract filenames from SRC_URI
+    // SRC_URI can contain:
+    // - URLs: https://example.com/file.tar.gz
+    // - Mirrors: mirror://gnu/foo/bar.tar.gz
+    // - Arrows: https://example.com/download -> renamed.tar.gz
+    
+    let mut total_size = 0u64;
+    let parts: Vec<&str> = src_uri.split_whitespace().collect();
+    let mut i = 0;
+    
+    while i < parts.len() {
+        let part = parts[i];
+        
+        // Skip USE conditionals and parentheses
+        if part.ends_with('?') || part == "(" || part == ")" {
+            i += 1;
+            continue;
+        }
+        
+        // Extract filename
+        let filename = if i + 2 < parts.len() && parts[i + 1] == "->" {
+            // Arrow notation: URL -> filename
+            i += 2;
+            parts[i]
+        } else if part.starts_with("http://") || part.starts_with("https://") || part.starts_with("ftp://") {
+            // Direct URL - extract filename from URL
+            part.split('/').last().unwrap_or(part)
+        } else if part.starts_with("mirror://") {
+            // Mirror URL - extract filename
+            part.split('/').last().unwrap_or(part)
+        } else {
+            // Assume it's a filename
+            part
+        };
+        
+        // Check if file exists in distfiles directory
+        let distfile_path = std::path::Path::new(distdir).join(filename);
+        if distfile_path.exists() {
+            if let Ok(metadata) = std::fs::metadata(&distfile_path) {
+                total_size += metadata.len();
+            }
+        } else {
+            // File doesn't exist in distfiles, try to get size from HTTP HEAD request
+            // For now, skip files we can't find (to avoid blocking on network)
+            // In a full implementation, we'd do async HEAD requests
+        }
+        
+        i += 1;
+    }
+    
+    if total_size > 0 {
+        Some(total_size)
+    } else {
+        None
+    }
+}
+
+async fn create_merge_plan(
+    cpv_packages: &[String],
+    vartree: &crate::vartree::VarTree,
+    porttree: &mut PortTree,
+) -> Result<Vec<MergePlanItem>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut plan = Vec::new();
+    let installed = vartree.get_all_installed().await.unwrap_or_default();
+
+    for cpv in cpv_packages {
+        let cp = if let Some(last_dash) = cpv.rfind('-') {
+            let cp_hyphenated = &cpv[..last_dash];
+            cp_hyphenated.replace('-', "/")
+        } else {
+            continue;
+        };
+
+        // Extract new version using pkgsplit
+        let full_new_cpv = format!("{}-{}", cp.replace("/", "-"), cpv.split('-').last().unwrap_or(""));
+        let new_version = if let Some((_, ver, rev)) = crate::versions::pkgsplit(&format!("placeholder/{}", full_new_cpv)) {
+            if rev == "r0" {
+                ver.to_string()
+            } else {
+                format!("{}-{}", ver, rev)
+            }
+        } else {
+            cpv.split('-').last().unwrap_or("").to_string()
+        };
+
+        // Find installed version - compare CP part
+        let cp_hyphenated = cp.replace("/", "-");
+        let old_version = installed.iter()
+            .find(|installed_cpv| {
+                // Extract CP from installed CPV by finding package name
+                installed_cpv.starts_with(&format!("{}-", cp_hyphenated))
+            })
+            .and_then(|installed_cpv| {
+                // Extract version from installed CPV
+                let installed_cpv_str = format!("placeholder/{}", installed_cpv);
+                if let Some((_, ver, rev)) = crate::versions::pkgsplit(&installed_cpv_str) {
+                    if rev == "r0" {
+                        Some(ver.to_string())
+                    } else {
+                        Some(format!("{}-{}", ver, rev))
+                    }
+                } else {
+                    None
+                }
+            });
+
+        let status = if let Some(ref old_ver) = old_version {
+            if let Some(cmp) = crate::versions::vercmp(old_ver, &new_version) {
+                if cmp < 0 {
+                    PackageStatus::Upgrade
+                } else if cmp > 0 {
+                    PackageStatus::Downgrade
+                } else {
+                    PackageStatus::Rebuild
+                }
+            } else {
+                PackageStatus::Rebuild
+            }
+        } else {
+            PackageStatus::New
+        };
+
+        let metadata = porttree.get_metadata(cpv).await;
+        let slot = metadata.as_ref().and_then(|m| m.get("SLOT").map(|s| s.clone()));
+        
+        // Get actual download size from distfiles or SRC_URI
+        let size = if let Some(m) = metadata.as_ref() {
+            if let Some(src_uri) = m.get("SRC_URI") {
+                get_download_size(src_uri, "/var/cache/distfiles").await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        plan.push(MergePlanItem {
+            cpv: cpv.clone(),
+            status,
+            old_version,
+            slot,
+            size,
+            use_changes: vec![],
+        });
+    }
+
+    Ok(plan)
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn display_merge_plan(plan: &[MergePlanItem]) {
+    println!("\nThese are the packages that would be merged, in order:\n");
+
+    let mut total_size = 0u64;
+    for item in plan {
+        let status_indicator = match item.status {
+            PackageStatus::New => "[N]",
+            PackageStatus::Upgrade => "[U]",
+            PackageStatus::Rebuild => "[R]",
+            PackageStatus::Downgrade => "[D]",
+        };
+
+        // Extract version from CPV using pkgsplit
+        let new_version = if let Some((_, ver, rev)) = crate::versions::pkgsplit(&item.cpv) {
+            if rev == "r0" {
+                ver
+            } else {
+                format!("{}-{}", ver, rev)
+            }
+        } else {
+            item.cpv.split('-').last().unwrap_or("").to_string()
+        };
+
+        let version_info = match (&item.status, &item.old_version) {
+            (PackageStatus::Rebuild, Some(old)) => {
+                format!("({} rebuilding)", old)
+            }
+            (_, Some(old)) => {
+                format!("({} -> {})", old, new_version)
+            }
+            _ => {
+                format!("({})", new_version)
+            }
+        };
+
+        let slot_info = if let Some(ref slot) = item.slot {
+            format!(":{}", slot)
+        } else {
+            String::new()
+        };
+
+        let size_info = if let Some(size) = item.size {
+            total_size += size;
+            format!(" [{}]", format_size(size))
+        } else {
+            String::new()
+        };
+
+        println!("{} {}{} {}{}", 
+                 status_indicator, 
+                 item.cpv, 
+                 slot_info,
+                 version_info,
+                 size_info);
+    }
+    
+    if total_size > 0 {
+        println!("\nTotal download size: {}", format_size(total_size));
+    }
+    println!();
+}
+
 async fn check_reverse_dependencies(
     packages: &[Atom],
     vartree: &crate::vartree::VarTree,
@@ -356,6 +602,67 @@ async fn get_package_dependencies(
 
     // Fall back to ebuild-based dependency resolution
     get_ebuild_dependencies(&cpv, porttree, with_bdeps).await
+}
+
+async fn build_recursive_depgraph(
+    atoms: &[crate::atom::Atom],
+    porttree: &PortTree,
+    with_bdeps: bool,
+    depgraph: &mut DepGraph,
+    max_depth: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::{HashSet, VecDeque};
+    
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(crate::atom::Atom, usize)> = VecDeque::new();
+    
+    for atom in atoms {
+        queue.push_back((atom.clone(), 0));
+    }
+    
+    while let Some((atom, depth)) = queue.pop_front() {
+        let cp = atom.cp();
+        
+        if visited.contains(&cp) || depth >= max_depth {
+            continue;
+        }
+        visited.insert(cp.clone());
+        
+        let (deps, dep_blockers) = match get_package_dependencies(&atom, porttree, with_bdeps).await {
+            Ok((deps, blockers)) => (deps, blockers),
+            Err(e) => {
+                eprintln!("Warning: Failed to get dependencies for {}: {}", cp, e);
+                continue;
+            }
+        };
+        
+        let blockers: Vec<crate::atom::Atom> = dep_blockers.into_iter().map(|dep_atom| {
+            crate::atom::Atom::new(&dep_atom.cpv).unwrap_or_else(|_| crate::atom::Atom {
+                category: dep_atom.cp().split('/').next().unwrap_or("unknown").to_string(),
+                package: dep_atom.cp().split('/').nth(1).unwrap_or(&dep_atom.cp()).to_string(),
+                version: None,
+                op: crate::atom::Operator::None,
+                slot: dep_atom.slot,
+                subslot: dep_atom.sub_slot,
+                repo: dep_atom.repo,
+                use_deps: dep_atom.use_deps,
+                blocker: dep_atom.blocker,
+            })
+        }).collect();
+        
+        if let Err(e) = depgraph.add_node_with_blockers(&cp, deps.clone(), blockers) {
+            eprintln!("Warning: Failed to add {} to dependency graph: {}", cp, e);
+            continue;
+        }
+        
+        for dep_node in deps {
+            if !visited.contains(&dep_node.atom.cp()) {
+                queue.push_back((dep_node.atom.clone(), depth + 1));
+            }
+        }
+    }
+    
+    Ok(())
 }
 
 async fn get_ebuild_dependencies(
@@ -624,43 +931,13 @@ pub async fn action_install_with_root(
     let mut porttree = PortTree::new(root);
     porttree.scan_repositories();
 
-    for atom in &atoms {
-        let (deps, dep_blockers) = match get_package_dependencies(&atom, &porttree, with_bdeps).await {
-            Ok((deps, blockers)) => {
-                println!("Found {} dependencies and {} blockers for {}", deps.len(), blockers.len(), atom.cp());
-                (deps, blockers)
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to get dependencies for {}: {}",
-                    atom.cp(),
-                    e
-                );
-                // Continue with empty dependencies rather than failing completely
-                (vec![], vec![])
-            }
-        };
-
-        // Convert dep::Atom blockers to atom::Atom
-        let blockers: Vec<crate::atom::Atom> = dep_blockers.into_iter().map(|dep_atom| {
-            crate::atom::Atom::new(&dep_atom.cpv).unwrap_or_else(|_| crate::atom::Atom {
-                category: dep_atom.cp().split('/').next().unwrap_or("unknown").to_string(),
-                package: dep_atom.cp().split('/').nth(1).unwrap_or(&dep_atom.cp()).to_string(),
-                version: None,
-                op: crate::atom::Operator::None,
-                slot: dep_atom.slot,
-                subslot: dep_atom.sub_slot,
-                repo: dep_atom.repo,
-                use_deps: dep_atom.use_deps,
-                blocker: dep_atom.blocker,
-            })
-        }).collect();
-
-        if let Err(e) = depgraph.add_node_with_blockers(&atom.cp(), deps, blockers) {
-            eprintln!("Failed to add {} to dependency graph: {}", atom.cp(), e);
-            return 1;
-        }
+    // Build recursive dependency graph (max depth 50 to prevent infinite loops)
+    println!("Calculating dependencies...");
+    if let Err(e) = build_recursive_depgraph(&atoms, &porttree, with_bdeps, &mut depgraph, 50).await {
+        eprintln!("Failed to build dependency graph: {}", e);
+        return 1;
     }
+    println!("Dependency calculation complete.");
 
     // Resolve dependencies
     match depgraph.resolve(&atoms.iter().map(|a| a.cp()).collect::<Vec<_>>()) {
@@ -769,9 +1046,6 @@ pub async fn action_install_with_root(
                             "gentoo"
                         );
                         println!(" * Use eselect news to read news items.\n");
-
-                        // In a full implementation, we might want to display news content here
-                        // For now, just notify about unread news
                     }
                 }
                 Err(e) => {
@@ -779,10 +1053,33 @@ pub async fn action_install_with_root(
                 }
             }
 
+            // Create and display merge plan
+            let vartree = crate::vartree::VarTree::new(root);
+            let merge_plan = match create_merge_plan(&cpv_packages, &vartree, &mut porttree).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    eprintln!("Failed to create merge plan: {}", e);
+                    return 1;
+                }
+            };
+            
+            display_merge_plan(&merge_plan);
+
             if ask {
-                println!("Would you like to proceed? (y/N)");
-                // Placeholder: in real implementation, read user input
-                println!("Proceeding with installation...");
+                println!("Would you like to proceed? (y/N) ");
+                use std::io::{self, BufRead};
+                let stdin = io::stdin();
+                let mut response = String::new();
+                if let Ok(_) = stdin.lock().read_line(&mut response) {
+                    let response = response.trim().to_lowercase();
+                    if response != "y" && response != "yes" {
+                        println!("Cancelled by user.");
+                        return 0;
+                    }
+                } else {
+                    println!("Failed to read input, aborting.");
+                    return 1;
+                }
             }
 
             // Actual installation logic
@@ -1311,10 +1608,23 @@ pub async fn action_upgrade(packages: &[String], pretend: bool, ask: bool, deep:
         return 0;
     }
 
-    println!("Packages to upgrade:");
-    for (cp, installed_version, available_version) in &packages_to_upgrade {
-        println!("  {}: {} -> {}", cp, installed_version, available_version);
+    // Collect CPVs for merge plan
+    let mut cpvs = Vec::new();
+    for (cp, _, _) in &packages_to_upgrade {
+        if let Ok(Some(cpv)) = merger.find_best_version_with_porttree(cp, Some(&porttree)).await {
+            cpvs.push(cpv);
+        }
     }
+
+    // Create and display merge plan
+    let merge_plan = match create_merge_plan(&cpvs, &vartree, &mut porttree).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("Failed to create merge plan: {}", e);
+            return 1;
+        }
+    };
+    display_merge_plan(&merge_plan);
 
     if pretend {
         println!(
@@ -1834,16 +2144,14 @@ async fn get_specific_upgradable_packages(
                                     if let Some(cmp) =
                                         crate::versions::vercmp(&installed_version, available_version)
                                     {
-                                        if cmp < 0 {
-                                            // installed < available
-                                            upgradable.push((
-                                                cp,
-                                                installed_version,
-                                                available_version.to_string(),
-                                            ));
-                                        } else {
-                                            println!("{} is already up to date.", cp);
-                                        }
+                                         if cmp < 0 {
+                                             // installed < available
+                                             upgradable.push((
+                                                 cp,
+                                                 installed_version,
+                                                 available_version.to_string(),
+                                             ));
+                                         }
                                     }
                                 }
                             } else {

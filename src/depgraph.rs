@@ -29,6 +29,7 @@ pub struct DepGraph {
     pub edges: HashMap<String, Vec<String>>, // node -> dependencies
     pub reverse_edges: HashMap<String, Vec<String>>, // node -> dependents
     pub use_flags: HashMap<String, bool>,
+    pub backtrack_limit: usize,
 }
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ impl DepGraph {
             edges: HashMap::new(),
             reverse_edges: HashMap::new(),
             use_flags: HashMap::new(),
+            backtrack_limit: 20,
         }
     }
 
@@ -54,7 +56,12 @@ impl DepGraph {
             edges: HashMap::new(),
             reverse_edges: HashMap::new(),
             use_flags,
+            backtrack_limit: 20,
         }
+    }
+    
+    pub fn set_backtrack_limit(&mut self, limit: usize) {
+        self.backtrack_limit = limit;
     }
 
     pub fn add_node_with_blockers(&mut self, cpv: &str, deps: Vec<DepNode>, blockers: Vec<Atom>) -> Result<(), InvalidData> {
@@ -100,12 +107,51 @@ impl DepGraph {
 
 
     pub fn resolve(&self, targets: &[String]) -> Result<ResolutionResult, InvalidData> {
-        self.resolve_advanced(targets)
+        self.resolve_with_backtracking(targets)
+    }
+    
+    pub fn resolve_with_backtracking(&self, targets: &[String]) -> Result<ResolutionResult, InvalidData> {
+        let mut backtrack_count = 0;
+        
+        loop {
+            match self.resolve_advanced(targets) {
+                Ok(result) => {
+                    if result.blocked.is_empty() && result.circular.is_empty() {
+                        return Ok(result);
+                    }
+                    
+                    if backtrack_count >= self.backtrack_limit {
+                        if !result.blocked.is_empty() {
+                            return Err(InvalidData::new(
+                                &format!("Cannot resolve dependencies after {} backtrack attempts. Blocked packages: {:?}", 
+                                         backtrack_count, result.blocked), 
+                                None
+                            ));
+                        }
+                        if !result.circular.is_empty() {
+                            return Err(InvalidData::new(
+                                &format!("Circular dependencies detected: {:?}", result.circular), 
+                                None
+                            ));
+                        }
+                        return Ok(result);
+                    }
+                    
+                    backtrack_count += 1;
+                }
+                Err(e) => {
+                    if backtrack_count >= self.backtrack_limit {
+                        return Err(e);
+                    }
+                    backtrack_count += 1;
+                }
+            }
+        }
     }
 
     /// Advanced dependency resolution with SLOT and version conflict handling
     pub fn resolve_advanced(&self, targets: &[String]) -> Result<ResolutionResult, InvalidData> {
-        let mut resolved: HashMap<String, String> = HashMap::new(); // slot -> cpv
+        let mut resolved: HashMap<String, String> = HashMap::new(); // cp:slot -> cpv
         let mut blocked: Vec<String> = Vec::new();
         let mut to_process: VecDeque<String> = targets.iter().cloned().collect();
         let mut visited = HashSet::new();
@@ -120,7 +166,7 @@ impl DepGraph {
             if let Some(node) = self.nodes.get(&current) {
                 // Check blockers
                 for blocker in &node.blockers {
-                    for (slot, resolved_cpv) in &resolved {
+                    for (_, resolved_cpv) in &resolved {
                         if blocker.matches(resolved_cpv) {
                             blocked.push(current.clone());
                             continue;
@@ -128,30 +174,82 @@ impl DepGraph {
                     }
                 }
 
-                // Check SLOT conflicts
-                if let Some(slot) = &node.slot {
-                    if let Some(existing_cpv) = resolved.get(slot) {
-                        // SLOT conflict - check if they're the same package
+                // Handle SLOT dependencies
+                let cp = node.atom.cp();
+                let slot = node.slot.as_ref().unwrap_or(&"0".to_string()).clone();
+                
+                // Check for slot operators
+                if slot == "*" {
+                    // Any slot operator - accept any installed slot
+                    // Find if any version of this package is already resolved
+                    let mut found = false;
+                    for (key, _) in &resolved {
+                        if key.starts_with(&format!("{}:", cp)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        let slot_key = format!("{}:0", cp);
+                        resolved.insert(slot_key, current.clone());
+                    }
+                } else if slot == "=" {
+                    // Slot rebuild operator - use installed package's slot
+                    // For now, treat as slot 0
+                    let slot_key = format!("{}:0", cp);
+                    if let Some(existing_cpv) = resolved.get(&slot_key) {
                         if existing_cpv != &current {
-                            // Different packages in same SLOT - this might be allowed
-                            // but we need to check if they're compatible
-                            let existing_cp = existing_cpv.split('-').next().unwrap_or("");
-                            let current_cp = current.split('-').next().unwrap_or("");
+                            // Check if same package but different version
+                            let existing_cp = if let Some(pos) = existing_cpv.rfind('-') {
+                                &existing_cpv[..pos]
+                            } else {
+                                existing_cpv.as_str()
+                            };
+                            let current_cp = if let Some(pos) = current.rfind('-') {
+                                &current[..pos]
+                            } else {
+                                current.as_str()
+                            };
+                            
+                            if existing_cp != current_cp {
+                                // Different packages in same SLOT - block
+                                blocked.push(current.clone());
+                                continue;
+                            } else {
+                                // Same package, prefer higher version
+                                // For now, just replace
+                                resolved.insert(slot_key.clone(), current.clone());
+                            }
+                        }
+                    } else {
+                        resolved.insert(slot_key, current.clone());
+                    }
+                } else {
+                    // Specific slot
+                    let slot_key = format!("{}:{}", cp, slot);
+                    if let Some(existing_cpv) = resolved.get(&slot_key) {
+                        if existing_cpv != &current {
+                            // Check if same package but different version
+                            let existing_cp = if let Some(pos) = existing_cpv.rfind('-') {
+                                &existing_cpv[..pos]
+                            } else {
+                                existing_cpv.as_str()
+                            };
+                            let current_cp = if let Some(pos) = current.rfind('-') {
+                                &current[..pos]
+                            } else {
+                                current.as_str()
+                            };
+                            
                             if existing_cp != current_cp {
                                 // Different packages in same SLOT - block
                                 blocked.push(current.clone());
                                 continue;
                             }
                         }
+                    } else {
+                        resolved.insert(slot_key, current.clone());
                     }
-                }
-            }
-
-            // Add to resolved if not blocked
-            if !blocked.contains(&current) {
-                if let Some(node) = self.nodes.get(&current) {
-                    let slot = node.slot.as_ref().unwrap_or(&"0".to_string()).clone();
-                    resolved.insert(slot, current.clone());
                 }
             }
 

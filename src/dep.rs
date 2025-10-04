@@ -33,10 +33,44 @@ impl Atom {
 
         let (slot, sub_slot) = if let Some(slot_str) = slot_part {
             let slot_str = &slot_str[1..]; // remove :
-            if let Some(slash_pos) = slot_str.find('/') {
-                (Some(slot_str[..slash_pos].to_string()), Some(slot_str[slash_pos+1..].to_string()))
+            
+            // Handle slot operators: :=, :*, :slot=
+            // Examples:
+            // :0 - specific slot
+            // := - rebuild on slot/subslot change
+            // :* - any slot
+            // :0/2.1= - specific slot with subslot rebuild operator
+            
+            if slot_str == "=" {
+                // Slot rebuild operator - will use installed package's slot
+                (Some("=".to_string()), Some("=".to_string()))
+            } else if slot_str == "*" {
+                // Any slot operator
+                (Some("*".to_string()), None)
+            } else if let Some(slash_pos) = slot_str.find('/') {
+                // Has subslot
+                let slot_part = &slot_str[..slash_pos];
+                let subslot_part = &slot_str[slash_pos + 1..];
+                
+                // Check for subslot rebuild operator
+                if subslot_part.ends_with('=') {
+                    let subslot_value = &subslot_part[..subslot_part.len() - 1];
+                    if subslot_value.is_empty() {
+                        // :slot/= means rebuild on subslot change
+                        (Some(slot_part.to_string()), Some("=".to_string()))
+                    } else {
+                        // :slot/subslot= means specific subslot with rebuild
+                        (Some(slot_part.to_string()), Some(subslot_value.to_string()))
+                    }
+                } else {
+                    (Some(slot_part.to_string()), Some(subslot_part.to_string()))
+                }
+            } else if slot_str.ends_with('=') {
+                // Slot rebuild operator with specific slot
+                let slot_value = &slot_str[..slot_str.len() - 1];
+                (Some(slot_value.to_string()), Some("=".to_string()))
             } else {
-                (Some(slot_str.to_string()), Some(slot_str.to_string()))
+                (Some(slot_str.to_string()), None)
             }
         } else {
             (None, None)

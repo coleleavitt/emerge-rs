@@ -207,24 +207,30 @@ impl PortTree {
     }
 
     pub fn get_ebuild_path(&self, cpv: &str) -> Option<String> {
-        // Parse CPV: category/package-version
-        let parts: Vec<&str> = cpv.split('/').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-
-        let category = parts[0];
-        let pkg_version = parts[1];
-
-        // Find the last dash to separate package name from version
-        if let Some(last_dash) = pkg_version.rfind('-') {
-            let package = &pkg_version[..last_dash];
-            let version = &pkg_version[last_dash + 1..];
+        // Parse CPV: category/package-version using pkgsplit
+        use crate::versions::pkgsplit;
+        
+        if let Some((cat_pkg, ver, rev)) = pkgsplit(cpv) {
+            // cat_pkg is "category/package"
+            let parts: Vec<&str> = cat_pkg.split('/').collect();
+            if parts.len() != 2 {
+                return None;
+            }
+            
+            let category = parts[0];
+            let package = parts[1];
+            
+            // Reconstruct version with revision
+            let full_version = if rev == "r0" {
+                ver
+            } else {
+                format!("{}-{}", ver, rev)
+            };
 
             // Check each repository
             for repo in self.repositories.values() {
                 let ebuild_path = format!("{}/{}/{}/{}-{}.ebuild",
-                    repo.location, category, package, package, version);
+                    repo.location, category, package, package, full_version);
 
                 if std::path::Path::new(&ebuild_path).exists() {
                     return Some(ebuild_path);
