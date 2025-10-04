@@ -1,49 +1,22 @@
 use crate::atom::Atom;
-use crate::dep_check::{DepCheckResult, DepChecker};
+use crate::dep_check::DepChecker;
 use crate::depgraph::DepGraph;
 use crate::depgraph::{DepNode, DepType};
 use crate::doebuild::Ebuild;
-use crate::exception::InvalidData;
 use crate::news::NewsManager;
 use crate::porttree::PortTree;
 use crate::sets;
-use std::fs;
+use crate::sync::controller::sync_repository;
 use std::path::Path;
-use std::process::Command;
-use std::thread;
-use std::time::Duration;
-
-#[derive(Debug)]
-enum SyncError {
-    Network(String),
-    Repository(String),
-    Command(String),
-    Validation(String),
-    Timeout(String),
-}
-
-impl std::fmt::Display for SyncError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SyncError::Network(msg) => write!(f, "Network error: {}", msg),
-            SyncError::Repository(msg) => write!(f, "Repository error: {}", msg),
-            SyncError::Command(msg) => write!(f, "Command error: {}", msg),
-            SyncError::Validation(msg) => write!(f, "Validation error: {}", msg),
-            SyncError::Timeout(msg) => write!(f, "Timeout error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for SyncError {}
 
 pub async fn action_sync() -> i32 {
+    use tokio_stream::StreamExt;
+
     println!("Syncing repositories...");
 
-    // Initialize portage tree to get repository information
     let mut porttree = PortTree::new("/");
     porttree.scan_repositories();
 
-    // Load existing sync metadata
     if let Err(e) = porttree.load_sync_metadata().await {
         eprintln!("Warning: Failed to load sync metadata: {}", e);
     }
@@ -56,65 +29,62 @@ pub async fn action_sync() -> i32 {
         return 0;
     }
 
-    // Create async tasks for parallel syncing
-    let mut sync_tasks = Vec::new();
+    println!("Starting sync for {} repositories...\n", total_count);
+
+    let mut tasks = tokio::task::JoinSet::new();
 
     for repo_name in repo_names {
         let repo = porttree.repositories.get(&repo_name).unwrap().clone();
-        let task = tokio::spawn(async move {
-            println!("Syncing repository: {}", repo_name);
-            let result = sync_repository_async(&repo).await;
+        tasks.spawn(async move {
+            println!(">>> Starting sync: {}", repo_name);
+            let result = sync_repository(&repo).await;
             (repo_name, result)
         });
-        sync_tasks.push(task);
     }
 
-    // Wait for all sync tasks to complete
     let mut success_count = 0;
-    let mut results = Vec::new();
-    for task in sync_tasks {
-        results.push(task.await);
-    }
+    let mut completed_count = 0;
 
-    for task_result in results {
+    while let Some(task_result) = tasks.join_next().await {
+        completed_count += 1;
+        
         match task_result {
             Ok((repo_name, sync_result)) => {
                 match sync_result {
-                    Ok(_) => {
-                        // Update sync metadata for success
+                    Ok(result) => {
                         porttree.update_sync_metadata(&repo_name, true, None);
 
-                        // Validate repository after sync
                         match porttree.validate_repository_integrity(&repo_name).await {
                             Ok(_) => {
-                                println!("Successfully synced and validated {}", repo_name);
+                                println!("✓ [{}/{}] Successfully synced {}: {}", 
+                                    completed_count, total_count, repo_name, result.message);
                                 success_count += 1;
                             }
                             Err(e) => {
-                                eprintln!("Synced {} but validation failed: {}", repo_name, e);
-                                // Still count as success since sync worked, but warn about validation
+                                eprintln!("⚠ [{}/{}] Synced {} but validation failed: {}", 
+                                    completed_count, total_count, repo_name, e);
                                 success_count += 1;
                             }
                         }
                     }
                     Err(e) => {
-                        // Update sync metadata for failure
                         porttree.update_sync_metadata(&repo_name, false, Some(e.to_string()));
-                        eprintln!("Failed to sync {}: {}", repo_name, e);
+                        eprintln!("✗ [{}/{}] Failed to sync {}: {}", 
+                            completed_count, total_count, repo_name, e);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Task panicked: {}", e);
+                eprintln!("✗ [{}/{}] Task panicked: {}", completed_count, total_count, e);
             }
         }
     }
 
-    // Save sync metadata
     if let Err(e) = porttree.save_sync_metadata().await {
         eprintln!("Warning: Failed to save sync metadata: {}", e);
     }
 
+    println!();
     if success_count == total_count {
         println!("All repositories synced successfully.");
         0
@@ -124,296 +94,7 @@ pub async fn action_sync() -> i32 {
     }
 }
 
-/// Run sync hooks for a repository
-fn run_sync_hooks(repo: &crate::porttree::Repository, phase: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let hooks_dir = Path::new(&repo.location).join("sync-hooks");
 
-    if !hooks_dir.exists() || !hooks_dir.is_dir() {
-        return Ok(()); // No hooks directory, nothing to do
-    }
-
-    // Look for hook scripts
-    let hook_files = ["pre-sync", "post-sync"];
-    let hook_file = match phase {
-        "pre" => "pre-sync",
-        "post" => "post-sync",
-        _ => return Ok(()),
-    };
-
-    let hook_path = hooks_dir.join(hook_file);
-    if hook_path.exists() && hook_path.is_file() {
-        println!("Running {} sync hook for {}", phase, repo.name);
-
-        let output = Command::new(&hook_path)
-            .env("REPO_NAME", &repo.name)
-            .env("REPO_LOCATION", &repo.location)
-            .env("SYNC_TYPE", repo.sync_type.as_deref().unwrap_or("unknown"))
-            .env("SYNC_URI", repo.sync_uri.as_deref().unwrap_or(""))
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("Sync hook {} failed for {}: {}", hook_file, repo.name, stderr);
-            return Err(format!("Sync hook {} failed: {}", hook_file, stderr).into());
-        }
-    }
-
-    Ok(())
-}
-
-
-
-async fn sync_git_repository_async(repo: &crate::porttree::Repository) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::process::Command;
-
-    // Check if git is available
-    let git_cmd = Command::new("git")
-        .arg("--version")
-        .output()
-        .await?;
-
-    if !git_cmd.status.success() {
-        return Err("git command not found".into());
-    }
-
-    let repo_path = std::path::Path::new(&repo.location);
-
-    // If repository doesn't exist, clone it
-    if !repo_path.exists() {
-        tokio::fs::create_dir_all(repo_path).await?;
-        println!("Cloning {} from {}", repo.name, repo.sync_uri.as_deref().unwrap_or("unknown"));
-
-        let mut clone_cmd = Command::new("git");
-        clone_cmd.arg("clone");
-
-        // Add depth if specified
-        if let Some(depth) = repo.sync_depth {
-            if depth != 0 {
-                clone_cmd.arg("--depth").arg(depth.to_string());
-            }
-        } else {
-            // Default depth for git repos
-            clone_cmd.arg("--depth").arg("1");
-        }
-
-        // Add quiet flag
-        clone_cmd.arg("--quiet");
-
-        clone_cmd.arg(repo.sync_uri.as_deref().unwrap_or(""))
-            .arg(".")
-            .current_dir(repo_path);
-
-        let result = clone_cmd.output().await?;
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            return Err(format!("git clone failed: {}", stderr).into());
-        }
-    } else {
-        // Repository exists, pull updates
-        println!("Pulling updates for {}", repo.name);
-
-        let mut pull_cmd = Command::new("git");
-        pull_cmd.arg("pull")
-            .arg("--quiet")
-            .current_dir(repo_path);
-
-        let result = pull_cmd.output().await?;
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            return Err(format!("git pull failed: {}", stderr).into());
-        }
-    }
-
-    Ok(())
-}
-
-async fn sync_rsync_repository_async(repo: &crate::porttree::Repository) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::process::Command;
-
-    // Check if rsync is available
-    let rsync_cmd = Command::new("rsync")
-        .arg("--version")
-        .output()
-        .await?;
-
-    if !rsync_cmd.status.success() {
-        return Err("rsync command not found".into());
-    }
-
-    let repo_path = std::path::Path::new(&repo.location);
-
-    // Ensure repository directory exists
-    tokio::fs::create_dir_all(repo_path).await?;
-
-    println!("Syncing {} via rsync from {}", repo.name, repo.sync_uri.as_deref().unwrap_or("unknown"));
-
-    let mut rsync_cmd = Command::new("rsync");
-    rsync_cmd.arg("--recursive")
-        .arg("--links")
-        .arg("--safe-links")
-        .arg("--perms")
-        .arg("--times")
-        .arg("--compress")
-        .arg("--force")
-        .arg("--whole-file")
-        .arg("--delete")
-        .arg("--stats")
-        .arg("--human-readable")
-        .arg("--timeout=180")
-        .arg("--exclude=/.git");
-
-    // Add quiet flag
-    rsync_cmd.arg("--quiet");
-
-    rsync_cmd.arg(repo.sync_uri.as_deref().unwrap_or(""))
-        .arg(&repo.location);
-
-    let result = rsync_cmd.output().await?;
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(format!("rsync failed: {}", stderr).into());
-    }
-
-    Ok(())
-}
-
-async fn sync_webrsync_repository_async(repo: &crate::porttree::Repository) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // WebRSync is more complex and involves downloading a tarball
-    // For now, we'll implement a basic version
-    println!("WebRSync not yet implemented for {}", repo.name);
-    Ok(())
-}
-
-async fn sync_repository_async(repo: &crate::porttree::Repository) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match repo.sync_type.as_deref() {
-        Some("git") => sync_git_repository_async(repo).await,
-        Some("rsync") => sync_rsync_repository_async(repo).await,
-        Some("webrsync") => sync_webrsync_repository_async(repo).await,
-        _ => Err(format!("Unsupported sync type: {:?}", repo.sync_type).into()),
-    }
-}
-
-async fn sync_repository(repo: &crate::porttree::Repository) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let repo_path = std::path::Path::new(&repo.location);
-
-    // Check repository integrity before syncing
-    if let Err(e) = check_repository_integrity(repo) {
-        eprintln!("Repository integrity check failed for {}: {}", repo.name, e);
-        // Try recovery
-        if let Err(recovery_err) = attempt_sync_recovery(repo) {
-            eprintln!("Recovery also failed: {}", recovery_err);
-            return Err(e);
-        }
-        println!("Repository {} recovered successfully", repo.name);
-    }
-
-    // Run pre-sync hooks
-    run_sync_hooks(repo, "pre")?;
-
-    // Determine sync type
-    let sync_type = repo.sync_type.as_deref().unwrap_or_else(|| {
-        // Auto-detect based on existing repository
-        let git_dir = repo_path.join(".git");
-        if git_dir.exists() {
-            "git"
-        } else {
-            "rsync"
-        }
-    });
-
-    let result = match sync_type {
-        "git" => sync_git_repository_async(repo).await,
-        "rsync" => sync_rsync_repository_async(repo).await,
-        "webrsync" => sync_webrsync_repository_async(repo).await,
-        _ => Err(format!("Unsupported sync type: {}", sync_type).into()),
-    };
-
-    // Run post-sync hooks (only if sync was successful and hooks-only-on-change is false,
-    // or if sync-hooks-only-on-change is true and there were actual changes)
-    if result.is_ok() {
-        let should_run_post = if repo.sync_hooks_only_on_change {
-            // Check if there were actual changes (simplified check: compare timestamps)
-            // For now, always run post hooks when sync succeeds
-            true
-        } else {
-            true
-        };
-
-        if should_run_post {
-            if let Err(e) = run_sync_hooks(repo, "post") {
-                eprintln!("Warning: Post-sync hook failed: {}", e);
-                // Don't fail the entire sync just because post-hook failed
-            }
-        }
-    }
-
-    result
-}
-
-/// Check repository integrity and attempt recovery if needed
-fn check_repository_integrity(repo: &crate::porttree::Repository) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let repo_path = Path::new(&repo.location);
-
-    // For git repositories, check and repair if needed
-    let git_dir = repo_path.join(".git");
-    if git_dir.exists() {
-        // Check if git repository is valid
-        let output = Command::new("git")
-            .args(&["fsck", "--no-progress"])
-            .current_dir(repo_path)
-            .output()?;
-
-        if !output.status.success() {
-            return Err("Git repository integrity check failed".into());
-        }
-    }
-
-    Ok(())
-}
-
-/// Attempt to recover from sync failures
-fn attempt_sync_recovery(repo: &crate::porttree::Repository) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let repo_path = Path::new(&repo.location);
-
-    // For git repositories, try common recovery methods
-    let git_dir = repo_path.join(".git");
-    if git_dir.exists() {
-        println!("Attempting recovery for git repository {}", repo.name);
-
-        // Try to reset to origin/HEAD
-        let reset_output = Command::new("git")
-            .args(&["reset", "--hard", "origin/HEAD"])
-            .current_dir(repo_path)
-            .output();
-
-        if let Ok(output) = reset_output {
-            if output.status.success() {
-                println!("Successfully reset {} to origin/HEAD", repo.name);
-                return Ok(());
-            }
-        }
-
-        // If reset failed, try to fetch and reset to a known good state
-        let _ = Command::new("git")
-            .args(&["fetch", "origin"])
-            .current_dir(repo_path)
-            .output();
-
-        let reset_output = Command::new("git")
-            .args(&["reset", "--hard", "FETCH_HEAD"])
-            .current_dir(repo_path)
-            .output();
-
-        if let Ok(output) = reset_output {
-            if output.status.success() {
-                println!("Successfully reset {} to FETCH_HEAD", repo.name);
-                return Ok(());
-            }
-        }
-    }
-
-    Err(SyncError::Repository(format!("Recovery failed for repository {}", repo.name)).into())
-}
 
 #[cfg(test)]
 mod tests {
@@ -581,6 +262,8 @@ auto-sync = true
 
     #[tokio::test]
     async fn test_sync_error_types() {
+        use crate::sync::SyncError;
+        
         let network_error = SyncError::Network("Connection failed".to_string());
         let repo_error = SyncError::Repository("Invalid repository".to_string());
         let command_error = SyncError::Command("Command failed".to_string());
@@ -593,54 +276,6 @@ auto-sync = true
         assert!(validation_error.to_string().contains("Validation error"));
         assert!(timeout_error.to_string().contains("Timeout error"));
     }
-}
-
-
-
-fn sync_git_merge(repo: &crate::porttree::Repository, repo_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // Check if we're on a branch that tracks remote
-    let branch_output = Command::new("git")
-        .args(&["branch", "--show-current"])
-        .current_dir(repo_path)
-        .output()?;
-
-    if branch_output.status.success() {
-        let branch = String::from_utf8_lossy(&branch_output.stdout)
-            .trim()
-            .to_string();
-
-        // Try to fast-forward merge
-        let merge_output = Command::new("git")
-            .args(&[
-                "merge",
-                "--ff-only",
-                "--quiet",
-                &format!("origin/{}", branch),
-            ])
-            .current_dir(repo_path)
-            .output()?;
-
-        if !merge_output.status.success() {
-            let stderr = String::from_utf8_lossy(&merge_output.stderr);
-            if stderr.contains("not possible") || stderr.contains("diverged") {
-                eprintln!(
-                    "Warning: Could not fast-forward merge {}. Repository has diverged from upstream.",
-                    repo.name
-                );
-                eprintln!("You may need to manually resolve conflicts or reset the repository.");
-                return Err(SyncError::Repository(format!("Fast-forward merge failed for {}", repo.name)).into());
-            } else {
-                return Err(SyncError::Command(format!("Git merge failed for {}: {}", repo.name, stderr)).into());
-            }
-        }
-    } else {
-        eprintln!(
-            "Warning: Could not determine current branch for {}. Repository may be in detached HEAD state.",
-            repo.name
-        );
-    }
-
-    Ok(())
 }
 
 async fn check_reverse_dependencies(

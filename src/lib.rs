@@ -16,6 +16,7 @@
   pub mod porttree;
   pub mod profile;
   pub mod sets;
+ pub mod sync;
  pub mod util;
  pub mod vartree;
  pub mod versions;

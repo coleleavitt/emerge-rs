@@ -11,6 +11,7 @@ use tokio::process::Command;
 pub struct PortTree {
     pub root: String,
     pub repositories: HashMap<String, Repository>,
+    pub main_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -40,19 +41,34 @@ impl PortTree {
         PortTree {
             root: root.to_string(),
             repositories: HashMap::new(),
+            main_repo: None,
         }
     }
 
     pub fn scan_repositories(&mut self) {
-        // Check for repos.conf files - use system configuration
         let repos_conf_paths = [
             "/etc/portage/repos.conf",
             "/usr/share/portage/config/repos.conf",
         ];
 
         for conf_path in &repos_conf_paths {
-            if let Ok(content) = fs::read_to_string(conf_path) {
-                self.parse_repos_conf(&content);
+            let path = Path::new(conf_path);
+            
+            if path.is_dir() {
+                if let Ok(entries) = fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        let entry_path = entry.path();
+                        if entry_path.is_file() && entry_path.extension().and_then(|s| s.to_str()) == Some("conf") {
+                            if let Ok(content) = fs::read_to_string(&entry_path) {
+                                self.parse_repos_conf(&content);
+                            }
+                        }
+                    }
+                }
+            } else if path.is_file() {
+                if let Ok(content) = fs::read_to_string(conf_path) {
+                    self.parse_repos_conf(&content);
+                }
             }
         }
 
@@ -80,9 +96,9 @@ impl PortTree {
     }
 
     pub fn parse_repos_conf(&mut self, content: &str) {
-        // INI-style parsing for repos.conf
         let mut current_section = String::new();
         let mut current_repo: Option<Repository> = None;
+        let mut in_default_section = false;
 
         for line in content.lines() {
             let line = line.trim();
@@ -91,21 +107,29 @@ impl PortTree {
             }
 
             if line.starts_with('[') && line.ends_with(']') {
-                // Save previous repository if it exists
                 if let Some(repo) = current_repo.take() {
-                    self.repositories.insert(repo.name.clone(), repo);
+                    if !repo.location.is_empty() {
+                        self.repositories.insert(repo.name.clone(), repo);
+                    }
                 }
 
-                // Start new section
                 current_section = line[1..line.len()-1].to_string();
+                
+                if current_section.to_uppercase() == "DEFAULT" {
+                    in_default_section = true;
+                    current_repo = None;
+                    continue;
+                }
+                
+                in_default_section = false;
                 current_repo = Some(Repository {
                     name: current_section.clone(),
                     location: String::new(),
                     sync_type: None,
                     sync_uri: None,
-                    auto_sync: true, // default to true
+                    auto_sync: true,
                     sync_depth: None,
-                    sync_hooks_only_on_change: false, // default to false
+                    sync_hooks_only_on_change: false,
                     sync_metadata: SyncMetadata {
                         last_sync: None,
                         last_attempt: None,
@@ -115,6 +139,15 @@ impl PortTree {
                     eclass_cache: HashMap::new(),
                     metadata_cache: HashMap::new(),
                 });
+            } else if in_default_section {
+                if let Some(eq_pos) = line.find('=') {
+                    let key = line[..eq_pos].trim();
+                    let value = line[eq_pos + 1..].trim().trim_matches('"');
+                    
+                    if key == "main-repo" {
+                        self.main_repo = Some(value.to_string());
+                    }
+                }
             } else if let Some(ref mut repo) = current_repo {
                 if let Some(eq_pos) = line.find('=') {
                     let key = line[..eq_pos].trim();
@@ -139,9 +172,10 @@ impl PortTree {
             }
         }
 
-        // Save the last repository
         if let Some(repo) = current_repo {
-            self.repositories.insert(repo.name.clone(), repo);
+            if !repo.location.is_empty() {
+                self.repositories.insert(repo.name.clone(), repo);
+            }
         }
     }
 
@@ -359,11 +393,21 @@ impl PortTree {
             }
         }
 
-        // Basic validation: check if some core directories exist
-        let core_dirs = ["app-admin", "app-misc", "sys-apps", "dev-lang"];
-        for dir in &core_dirs {
-            if !repo_path.join(dir).exists() {
-                eprintln!("Warning: Core directory {} missing from repository {}", dir, repo_name);
+        let is_main_repo = self.main_repo.as_ref().map(|m| m == repo_name).unwrap_or(false);
+        
+        if is_main_repo {
+            let core_dirs = ["app-admin", "app-misc", "sys-apps", "dev-lang"];
+            let mut missing_dirs = Vec::new();
+            
+            for dir in &core_dirs {
+                if !repo_path.join(dir).exists() {
+                    missing_dirs.push(*dir);
+                }
+            }
+            
+            if !missing_dirs.is_empty() {
+                eprintln!("Warning: Main repository {} missing core directories: {}", 
+                    repo_name, missing_dirs.join(", "));
             }
         }
 
