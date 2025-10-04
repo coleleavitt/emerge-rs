@@ -702,6 +702,86 @@ async fn check_reverse_dependencies(
     Ok(blocked)
 }
 
+async fn check_use_changes(
+    cp: &str,
+    available_cpv: &str,
+    installed_cpv: &str,
+    porttree: &mut PortTree,
+    vartree: &crate::vartree::VarTree,
+) -> bool {
+    // Extract package directory from installed CPV
+    // installed_cpv is like "sys-apps-coreutils-9.7"
+    // We need to convert to "sys-apps/coreutils-9.7"
+    let parts: Vec<&str> = installed_cpv.splitn(3, '-').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    
+    let pkg_dir = format!("{}/{}-{}", parts[0], parts[1], parts[2]);
+    let use_file = format!("/var/db/pkg/{}/USE", pkg_dir);
+    let iuse_file = format!("/var/db/pkg/{}/IUSE", pkg_dir);
+    
+    // Get installed USE flags
+    let installed_use = std::fs::read_to_string(&use_file)
+        .ok()
+        .map(|s| {
+            s.split_whitespace()
+                .filter(|f| !f.is_empty())
+                .map(String::from)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    
+    // Get installed IUSE
+    let installed_iuse = std::fs::read_to_string(&iuse_file)
+        .ok()
+        .map(|s| {
+            s.split_whitespace()
+                .filter(|f| !f.is_empty())
+                .map(|f| f.trim_start_matches('+').trim_start_matches('-').to_string())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    
+    // Get available IUSE from metadata
+    let available_metadata = porttree.get_metadata(available_cpv).await;
+    let available_iuse = available_metadata
+        .as_ref()
+        .and_then(|m| m.get("IUSE"))
+        .map(|s| {
+            s.split_whitespace()
+                .filter(|f| !f.is_empty())
+                .map(|f| f.trim_start_matches('+').trim_start_matches('-').to_string())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    
+    // Only rebuild if:
+    // 1. New USE flags were added to IUSE, OR
+    // 2. USE flags were removed from IUSE, OR
+    // 3. Installed USE flags intersect with changed IUSE
+    
+    let new_flags: std::collections::HashSet<_> = available_iuse.difference(&installed_iuse).collect();
+    let removed_flags: std::collections::HashSet<_> = installed_iuse.difference(&available_iuse).collect();
+    
+    // Check if any of the changed flags affect the installed USE
+    for flag in new_flags {
+        // If a new flag exists and might be enabled by default, consider rebuild
+        if installed_use.contains(flag.as_str()) {
+            return true;
+        }
+    }
+    
+    for flag in removed_flags {
+        // If a flag was removed but was being used, definitely rebuild
+        if installed_use.contains(flag.as_str()) {
+            return true;
+        }
+    }
+    
+    false
+}
+
 async fn get_package_dependencies(
     atom: &crate::atom::Atom,
     porttree: &PortTree,
@@ -1119,76 +1199,219 @@ pub async fn action_upgrade(
             println!("Resolved {} packages from dependency tree", result.resolved.len());
             println!("Dependency resolution took {:.2} ms", result.resolution_time_ms as f64 / 1000.0);
 
-            // Now filter to only packages that actually need upgrading
+            // Now categorize packages: new, upgrade, reinstall, new slot
             let vartree = crate::vartree::VarTree::new("/");
             let merger = crate::merge::Merger::new("/");
 
             let installed = vartree.get_all_installed().await.unwrap_or_default();
 
-            let mut packages_to_upgrade = Vec::new();
-            for cp in &result.resolved {
-                // The resolved list contains CPs, not CPVs
-                // Check if this package needs upgrading
-                if let Ok(Some(available_cpv)) = merger.find_best_version_with_porttree(&cp, Some(&porttree)).await {
-                    // Check if the available version is masked
-                    let available_atom_str = format!("={}", available_cpv);
-                    if let Ok(available_atom) = crate::atom::Atom::new(&available_atom_str) {
-                        if let Some(_mask_reason) = mask_manager.is_masked(&available_atom).await.unwrap_or(None) {
-                            continue;
-                        }
-                    }
+            #[derive(Debug)]
+            struct PackageAction {
+                cp: String,
+                available_cpv: String,
+                installed_cpv: Option<String>,
+                status: String, // "U", "N", "R", "NS"
+                old_version: Option<String>,
+                new_version: String,
+                slot: Option<String>,
+                mask_reason: Option<String>,
+            }
 
-                    // Use pkgsplit to properly extract version from CPV
-                    if let Some((_cat_pkg, avail_ver, avail_rev)) = crate::versions::pkgsplit(&available_cpv) {
-                        let available_version = if avail_rev == "r0" {
+            let mut actions = Vec::new();
+            let mut masked_packages = Vec::new();
+            
+            // Build a set of CPs to check
+            // Start with packages from the resolved dependency tree
+            let mut cps_to_check: std::collections::HashSet<String> = result.resolved.iter().cloned().collect();
+            
+            // With --with-bdeps=y, include all installed packages that might need rebuilding
+            // This matches emerge's behavior of checking everything
+            if with_bdeps {
+                for installed_cpv in &installed {
+                    // installed_cpv is like "sys-apps-coreutils-9.7"
+                    // Split into category, package, version
+                    let parts: Vec<&str> = installed_cpv.splitn(3, '-').collect();
+                    if parts.len() >= 3 {
+                        let cp = format!("{}/{}", parts[0], parts[1]);
+                        cps_to_check.insert(cp);
+                    }
+                }
+            }
+            
+            for cp in &cps_to_check {
+                // Find the best available version
+                if let Ok(Some(available_cpv)) = merger.find_best_version_with_porttree(&cp, Some(&porttree)).await {
+                    let available_atom_str = format!("={}", available_cpv);
+                    let available_atom = match crate::atom::Atom::new(&available_atom_str) {
+                        Ok(atom) => atom,
+                        Err(_) => continue,
+                    };
+
+                    // Check if masked
+                    let mask_reason = mask_manager.is_masked(&available_atom).await.unwrap_or(None);
+                    
+                    // Use pkgsplit to extract version and slot
+                    let (available_version, slot) = if let Some((_cat_pkg, avail_ver, avail_rev)) = crate::versions::pkgsplit(&available_cpv) {
+                        let version = if avail_rev == "r0" {
                             avail_ver
                         } else {
                             format!("{}-{}", avail_ver, avail_rev)
                         };
+                        // Get slot from metadata
+                        let slot = porttree.get_metadata(&available_cpv).await
+                            .and_then(|m| m.get("SLOT").map(|s| s.split('/').next().unwrap_or(s).to_string()));
+                        (version, slot)
+                    } else {
+                        continue;
+                    };
 
-                        // Check if installed
-                        let cp_hyphenated = cp.replace('/', "-");
-                        let search_prefix = format!("{}-", cp_hyphenated);
-                        let mut found_installed = None;
-                        
-                        for installed_cpv in &installed {
-                            if installed_cpv.starts_with(&search_prefix) {
-                                // Use pkgsplit to extract version from installed CPV
-                                let version_part = installed_cpv.trim_start_matches(&search_prefix);
-                                let installed_full = format!("{}-{}", cp, version_part);
-                                if let Some((_cat_pkg, inst_ver, inst_rev)) = crate::versions::pkgsplit(&installed_full) {
-                                    let installed_version = if inst_rev == "r0" {
-                                        inst_ver
-                                    } else {
-                                        format!("{}-{}", inst_ver, inst_rev)
-                                    };
-                                    found_installed = Some(installed_version);
-                                }
+                    // Check if installed
+                    let cp_hyphenated = cp.replace('/', "-");
+                    let search_prefix = format!("{}-", cp_hyphenated);
+                    let mut found_installed: Option<(String, String, Option<String>)> = None; // (cpv, version, slot)
+                    
+                    for installed_cpv in &installed {
+                        if installed_cpv.starts_with(&search_prefix) {
+                            let version_part = installed_cpv.trim_start_matches(&search_prefix);
+                            let installed_full = format!("{}-{}", cp, version_part);
+                            if let Some((_cat_pkg, inst_ver, inst_rev)) = crate::versions::pkgsplit(&installed_full) {
+                                let installed_version = if inst_rev == "r0" {
+                                    inst_ver
+                                } else {
+                                    format!("{}-{}", inst_ver, inst_rev)
+                                };
+                                // Get installed slot from vartree metadata
+                                let installed_slot = vartree.get_pkg_info(installed_cpv).await.ok()
+                                    .and_then(|info| info)
+                                    .and_then(|pkg| {
+                                        // Read SLOT file from /var/db/pkg/category/package-version/SLOT
+                                        std::fs::read_to_string(format!("/var/db/pkg/{}/{}/SLOT", cp, version_part)).ok()
+                                    })
+                                    .map(|s| s.trim().split('/').next().unwrap_or(&s).to_string());
+                                
+                                found_installed = Some((installed_cpv.clone(), installed_version, installed_slot));
                                 break;
                             }
                         }
+                    }
 
-                        if let Some(installed_version) = found_installed {
-                            // Compare versions
-                            if let Some(cmp) = crate::versions::vercmp(&installed_version, &available_version) {
-                                if cmp < 0 {
-                                    // installed < available
-                                    packages_to_upgrade.push((cp.clone(), installed_version, available_version.to_string()));
+                    // Determine status
+                    let status = if let Some((inst_cpv, inst_ver, inst_slot)) = &found_installed {
+                        if let Some(cmp) = crate::versions::vercmp(&inst_ver, &available_version) {
+                            if cmp < 0 {
+                                // Check if it's a new slot
+                                if slot.is_some() && inst_slot.is_some() && slot != *inst_slot {
+                                    "NS" // New slot
+                                } else {
+                                    "U" // Upgrade
                                 }
+                            } else if cmp == 0 {
+                                // Same version - mark as rebuild
+                                // This happens when:
+                                // 1. A dependency was upgraded (package is in resolved tree)
+                                // 2. USE flags changed (with -N)
+                                // 3. Slot/ABI changes
+                                "R"
+                            } else {
+                                continue // Downgrade, skip
                             }
+                        } else {
+                            continue
                         }
+                    } else {
+                        // Not installed - only include if it's a build dependency and with_bdeps=y
+                        // or if it's in the resolved dependency tree
+                        if result.resolved.contains(&cp.to_string()) {
+                            "N" // New package
+                        } else {
+                            continue // Not in resolved tree and not installed, skip
+                        }
+                    };
+
+                    let action = PackageAction {
+                        cp: cp.clone(),
+                        available_cpv: available_cpv.clone(),
+                        installed_cpv: found_installed.as_ref().map(|(cpv, _, _)| cpv.clone()),
+                        status: status.to_string(),
+                        old_version: found_installed.as_ref().map(|(_, ver, _)| ver.clone()),
+                        new_version: available_version,
+                        slot,
+                        mask_reason: mask_reason.clone(),
+                    };
+
+                    if mask_reason.is_some() {
+                        masked_packages.push(action);
+                    } else {
+                        actions.push(action);
                     }
                 }
             }
 
-            if packages_to_upgrade.is_empty() {
+            // Count by status
+            let upgrades = actions.iter().filter(|a| a.status == "U").count();
+            let new_packages = actions.iter().filter(|a| a.status == "N").count();
+            let reinstalls = actions.iter().filter(|a| a.status == "R").count();
+            let new_slots = actions.iter().filter(|a| a.status == "NS").count();
+
+            if actions.is_empty() && masked_packages.is_empty() {
                 println!("No packages to upgrade.");
                 return 0;
             }
 
-            println!("Found {} packages that need upgrading", packages_to_upgrade.len());
+            println!("\nThese are the packages that would be merged, in order:\n");
+            
+            // Display packages grouped by status
+            // First show upgrades
+            for action in actions.iter().filter(|a| a.status == "U") {
+                let version_info = if let Some(old_ver) = &action.old_version {
+                    format!("[{} -> {}]", old_ver, action.new_version)
+                } else {
+                    format!("[{}]", action.new_version)
+                };
+                
+                println!("[ebuild     U  ] {}{} {}", action.cp, 
+                    action.slot.as_ref().map(|s| format!(":{}", s)).unwrap_or_default(),
+                    version_info);
+            }
+            
+            // Then new packages
+            for action in actions.iter().filter(|a| a.status == "N") {
+                println!("[ebuild  N     ] {}{} [{}]", action.cp,
+                    action.slot.as_ref().map(|s| format!(":{}", s)).unwrap_or_default(),
+                    action.new_version);
+            }
+            
+            // New slots
+            for action in actions.iter().filter(|a| a.status == "NS") {
+                let version_info = if let Some(old_ver) = &action.old_version {
+                    format!("[{} -> {}]", old_ver, action.new_version)
+                } else {
+                    format!("[{}]", action.new_version)
+                };
+                
+                println!("[ebuild  NS    ] {}{} {}", action.cp,
+                    action.slot.as_ref().map(|s| format!(":{}", s)).unwrap_or_default(),
+                    version_info);
+            }
+            
+            // Rebuilds last
+            for action in actions.iter().filter(|a| a.status == "R") {
+                println!("[ebuild   R    ] {}{} [{}]", action.cp,
+                    action.slot.as_ref().map(|s| format!(":{}", s)).unwrap_or_default(),
+                    action.new_version);
+            }
 
-            // For testing, just return success
+            println!("\nTotal: {} packages ({} upgrades, {} new, {} in new slots, {} reinstalls)",
+                actions.len(), upgrades, new_packages, new_slots, reinstalls);
+
+            // Show masked packages
+            if !masked_packages.is_empty() {
+                println!("\n!!! The following updates are masked:");
+                for action in &masked_packages {
+                    println!("- {} ({})", action.cp, action.mask_reason.as_ref().unwrap_or(&"unknown reason".to_string()));
+                }
+            }
+
             return 0;
         }
         Err(e) => {
