@@ -1,5 +1,4 @@
 // use_helpers.rs - USE flag helper functions
-use crate::exception::InvalidData;
 use super::environment::EbuildEnvironment;
 
 /// Check if USE flag is enabled

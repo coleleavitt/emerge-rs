@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use std::path::Path;
 use crate::exception::InvalidData;
 use crate::xpak;

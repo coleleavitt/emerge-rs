@@ -7,7 +7,6 @@ use crate::news::NewsManager;
 use crate::porttree::PortTree;
 use crate::sets;
 use crate::sync::controller::sync_repository;
-use std::path::Path;
 
 #[derive(Debug, Clone)]
 enum PackageStatus {
@@ -1022,7 +1021,7 @@ pub async fn action_install_with_root(
 
             // Check license acceptance for all packages to be installed
             let license_manager = crate::license::LicenseManager::new("/");
-            match license_manager.check_and_prompt_licenses(&cpv_packages, &mut porttree).await {
+            match license_manager.check_and_prompt_licenses(&cpv_packages, &mut porttree, pretend_mode).await {
                 Ok(accepted) => {
                     if !accepted {
                         eprintln!("License acceptance required. Aborting installation.");
@@ -1608,23 +1607,74 @@ pub async fn action_upgrade(packages: &[String], pretend: bool, ask: bool, deep:
         return 0;
     }
 
-    // Collect CPVs for merge plan
-    let mut cpvs = Vec::new();
+    // Create atoms for the packages to upgrade
+    let mut upgrade_atoms = Vec::new();
     for (cp, _, _) in &packages_to_upgrade {
         if let Ok(Some(cpv)) = merger.find_best_version_with_porttree(cp, Some(&porttree)).await {
-            cpvs.push(cpv);
+            if let Some(cp_key) = crate::versions::cpv_getkey(&cpv) {
+                if let Some(version) = crate::versions::cpv_getversion(&cpv) {
+                    let parts: Vec<&str> = cp_key.split('/').collect();
+                    if parts.len() == 2 {
+                        let atom = Atom {
+                            category: parts[0].to_string(),
+                            package: parts[1].to_string(),
+                            version: Some(version),
+                            op: crate::atom::Operator::None,
+                            slot: None,
+                            subslot: None,
+                            repo: None,
+                            use_deps: vec![],
+                            blocker: None,
+                        };
+                        upgrade_atoms.push(atom);
+                    }
+                }
+            }
         }
     }
 
-    // Create and display merge plan
-    let merge_plan = match create_merge_plan(&cpvs, &vartree, &mut porttree).await {
-        Ok(plan) => plan,
+    // Build dependency graph
+    let use_flags = config.get_use_flags_map();
+    let mut depgraph = DepGraph::with_use_flags(use_flags);
+    if let Err(e) = build_recursive_depgraph(&upgrade_atoms, &porttree, with_bdeps, &mut depgraph, 50).await {
+        eprintln!("Failed to build dependency graph: {}", e);
+        return 1;
+    }
+
+    match depgraph.resolve(&upgrade_atoms.iter().map(|a| a.cp()).collect::<Vec<_>>()) {
+        Ok(result) => {
+            if !result.blocked.is_empty() {
+                eprintln!("Blocked packages: {:?}", result.blocked);
+                return 1;
+            }
+            if !result.circular.is_empty() {
+                eprintln!("Circular dependencies: {:?}", result.circular);
+                return 1;
+            }
+
+            // Get CPVs for all resolved packages
+            let mut all_cpvs = Vec::new();
+            for cp in &result.resolved {
+                if let Ok(Some(cpv)) = merger.find_best_version_with_porttree(cp, Some(&porttree)).await {
+                    all_cpvs.push(cpv);
+                }
+            }
+
+            // Create merge plan for all
+            let merge_plan = match create_merge_plan(&all_cpvs, &vartree, &mut porttree).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    eprintln!("Failed to create merge plan: {}", e);
+                    return 1;
+                }
+            };
+            display_merge_plan(&merge_plan);
+        }
         Err(e) => {
-            eprintln!("Failed to create merge plan: {}", e);
+            eprintln!("Dependency resolution failed: {}", e);
             return 1;
         }
-    };
-    display_merge_plan(&merge_plan);
+    }
 
     if pretend {
         println!(

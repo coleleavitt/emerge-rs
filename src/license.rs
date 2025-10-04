@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use crate::exception::InvalidData;
 
@@ -161,7 +160,12 @@ impl LicenseManager {
 
     /// Check licenses for a list of packages and prompt for acceptance if needed
     /// Returns true if all licenses are accepted or user accepts them
-    pub async fn check_and_prompt_licenses(&self, packages: &[String], porttree: &mut crate::porttree::PortTree) -> Result<bool, InvalidData> {
+    pub async fn check_and_prompt_licenses(&self, packages: &[String], porttree: &mut crate::porttree::PortTree, pretend: bool) -> Result<bool, InvalidData> {
+        if pretend {
+            // In pretend mode, skip license prompting
+            return Ok(true);
+        }
+
         let mut unaccepted_licenses = Vec::new();
 
         // Collect all unique licenses that need acceptance

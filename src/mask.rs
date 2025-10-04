@@ -1,9 +1,8 @@
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use crate::exception::InvalidData;
 use crate::atom::Atom;
-use crate::profile::{ProfileManager, Profile};
+use crate::profile::ProfileManager;
 
 /// Package masking types
 #[derive(Debug, Clone, PartialEq)]

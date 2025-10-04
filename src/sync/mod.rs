@@ -1,7 +1,6 @@
 pub mod backends;
 pub mod controller;
 
-use crate::exception::InvalidData;
 use std::fmt;
 
 #[derive(Debug)]

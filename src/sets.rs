@@ -1,9 +1,6 @@
-use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use crate::exception::InvalidData;
-use crate::atom::Atom;
 use crate::profile::ProfileManager;
 
 /// Package set types

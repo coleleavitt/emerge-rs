@@ -249,7 +249,7 @@ pub fn default(env: &mut EbuildEnvironment, phase: &str) -> Result<(), InvalidDa
 }
 
 pub fn default_src_unpack(env: &EbuildEnvironment) -> Result<(), InvalidData> {
-    use std::process::Command;
+    
 
     // Get SRC_URI and A (archive files) from environment
     let distdir = env.get("DISTDIR").map(|s| s.clone()).unwrap_or_else(|| "/var/cache/distfiles".to_string());
@@ -598,7 +598,7 @@ fn eapply_user(env: &EbuildEnvironment) -> Result<(), InvalidData> {
 }
 
 pub fn default_src_configure(env: &mut EbuildEnvironment) -> Result<(), InvalidData> {
-    use std::process::Command;
+    
     
     let configure_script = env.sourcedir.join("configure");
     let cmake_file = env.sourcedir.join("CMakeLists.txt");

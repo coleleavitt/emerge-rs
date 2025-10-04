@@ -5,7 +5,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use crate::exception::InvalidData;
-use crate::atom::Atom;
 use chrono;
 use nix::unistd;
 use crate::ebuild::EbuildEnvironment;
@@ -217,7 +216,7 @@ impl Ebuild {
             } else if line.starts_with("HOMEPAGE=") {
                 metadata.homepage = Self::extract_quoted_value(line);
             } else if line.starts_with("SRC_URI=") || line.starts_with("SRC_URI+=") {
-                let mut current_src_uri = Self::extract_array_value_with_vars(line, &variables);
+                let current_src_uri = Self::extract_array_value_with_vars(line, &variables);
                 metadata.src_uri.extend(current_src_uri);
             } else if line.starts_with("LICENSE=") {
                 metadata.license = Self::extract_quoted_value(line);
@@ -405,7 +404,7 @@ impl BuildEnv {
 
     /// Extract archive filenames from expanded SRC_URI string
     fn extract_archive_names_from_string(src_uri: &str) -> String {
-        use std::collections::HashMap;
+        
 
         let uri_map = Self::parse_src_uri_for_archives(src_uri);
         uri_map.keys().cloned().collect::<Vec<_>>().join(" ")

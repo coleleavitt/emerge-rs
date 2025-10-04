@@ -1,8 +1,6 @@
 // xpak.rs -- XPAK archive handling
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Write};
 use std::path::Path;
 
 pub fn encodeint(myint: u32) -> [u8; 4] {

@@ -2,7 +2,6 @@
 
 use tokio::fs;
 use std::path::Path;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use crate::exception::InvalidData;
@@ -502,7 +501,7 @@ impl Merger {
 
                 // Extract the tar.bz2 part (everything before XPAK)
                 let pkg_path = Path::new(&info.path);
-                let mut file = fs::File::open(pkg_path).await
+                let file = fs::File::open(pkg_path).await
                     .map_err(|e| InvalidData::new(&format!("Failed to open binary package: {}", e), None))?;
 
                 // Create temp directory for extraction
@@ -516,7 +515,7 @@ impl Merger {
                     .map_err(|e| InvalidData::new(&format!("Failed to create extract dir: {}", e), None))?;
 
                 // Extract tar.bz2 part
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                
 
                 // Use dd to extract the tar.bz2 part (first tar_size bytes)
                 let tar_path = extract_dir.join("package.tar.bz2");

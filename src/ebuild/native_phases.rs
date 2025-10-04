@@ -2,7 +2,7 @@
 //
 // Implements all standard ebuild phases in native Rust
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::os::unix::fs::PermissionsExt;
 use crate::exception::InvalidData;
@@ -371,7 +371,7 @@ impl NativePhaseExecutor {
     
     pub fn merge(&self, env: &EbuildEnvironment, root: &str) -> Result<(), InvalidData> {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
+        
         
         einfo(&format!("Merging to {}", root));
         

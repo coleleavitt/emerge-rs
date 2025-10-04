@@ -3,7 +3,6 @@
 // This module parses bash function bodies from ebuilds and translates
 // common helper calls into native Rust function invocations
 
-use std::collections::HashMap;
 use crate::exception::InvalidData;
 use super::environment::EbuildEnvironment;
 

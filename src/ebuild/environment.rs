@@ -1,7 +1,6 @@
 // environment.rs - Ebuild environment management
 use std::collections::HashMap;
 use std::path::PathBuf;
-use crate::exception::InvalidData;
 
 /// Ebuild execution environment
 #[derive(Debug, Clone)]

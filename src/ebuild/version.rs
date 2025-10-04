@@ -31,7 +31,7 @@ pub fn ver_cut(range: &str, version: &str) -> Result<String, String> {
 /// ver_rs 2 _ 1.2.3 => 1.2_3
 /// ver_rs 1-2 - 1.2.3 => 1-2-3
 pub fn ver_rs(range: &str, replacement: &str, version: &str) -> Result<String, String> {
-    let mut components: Vec<String> = version.split('.').map(|s| s.to_string()).collect();
+    let components: Vec<String> = version.split('.').map(|s| s.to_string()).collect();
     
     let (begin, end) = parse_range(range, components.len())?;
     
@@ -44,7 +44,7 @@ pub fn ver_rs(range: &str, replacement: &str, version: &str) -> Result<String, S
     let mut result = components[0].clone();
     
     for i in 1..components.len() {
-        let separator = if i >= begin && i < end_idx {
+        let separator = if i >= begin && i <= end_idx {
             replacement
         } else {
             "."

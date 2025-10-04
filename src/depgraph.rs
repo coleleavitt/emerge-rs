@@ -1,10 +1,9 @@
 // depgraph.rs -- Dependency graph resolution
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use crate::atom::{Atom, Operator};
+use crate::atom::Atom;
 use crate::exception::InvalidData;
-use crate::versions::vercmp;
-use crate::dep::{expand_use_flags, dep_satisfied_with_use};
+use crate::dep::dep_satisfied_with_use;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DepType {

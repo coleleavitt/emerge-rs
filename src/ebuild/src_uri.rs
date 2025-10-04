@@ -357,7 +357,7 @@ fn execute_command(command: &str, vars: &HashMap<String, String>) -> Result<Stri
 /// Parse SRC_URI string into structured URIs
 pub fn parse_src_uri(src_uri: &str, vars: &HashMap<String, String>, use_flags: &HashMap<String, bool>) -> Result<Vec<SrcUri>, InvalidData> {
     let mut uris = Vec::new();
-    let mut tokens = tokenize_src_uri(src_uri);
+    let tokens = tokenize_src_uri(src_uri);
     let mut i = 0;
     
     while i < tokens.len() {

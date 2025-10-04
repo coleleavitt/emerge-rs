@@ -1,9 +1,8 @@
 // install_helpers.rs - Installation helper functions (dobin, doins, etc.)
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use crate::exception::InvalidData;
 use super::environment::EbuildEnvironment;
-use super::portage_helpers::*;
 
 /// Install executables into /usr/bin
 pub fn dobin(env: &EbuildEnvironment, files: &[&str]) -> Result<(), InvalidData> {

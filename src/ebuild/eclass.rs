@@ -398,7 +398,7 @@ pub mod meson {
 pub mod savedconfig {
     use super::*;
     use std::fs;
-    use std::path::Path;
+    
 
     /// Restore saved configuration from a config file
     pub fn restore_config(env: &mut EbuildEnvironment, config_file: &str) -> Result<(), InvalidData> {
@@ -552,8 +552,8 @@ pub mod unpacker {
 /// XDG eclass functions
 pub mod xdg {
     use super::*;
-    use std::fs;
-    use std::path::Path;
+    
+    
 
     pub fn src_prepare(env: &mut EbuildEnvironment) -> Result<(), InvalidData> {
         // Ensure XDG directories exist
@@ -731,7 +731,7 @@ pub mod bash_completion_r1 {
 
 /// Lua eclass functions
 pub mod lua {
-    use super::*;
+    
     use std::process::Command;
     
     /// Get Lua version
@@ -762,7 +762,7 @@ pub mod lua {
 
 /// Qt6 eclass functions
 pub mod qt6 {
-    use super::*;
+    
     use std::process::Command;
     
     /// Get Qt6 binary directory

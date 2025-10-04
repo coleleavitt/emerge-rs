@@ -5,7 +5,6 @@
 // 2. Files in source directory (CMakeLists.txt, meson.build, configure, etc.)
 
 use std::path::Path;
-use crate::exception::InvalidData;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildSystem {

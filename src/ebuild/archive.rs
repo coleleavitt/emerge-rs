@@ -2,9 +2,8 @@
 //
 // Supports: .tar.gz, .tar.bz2, .tar.xz, .tar.zst, .zip, .deb, .rar, .7z
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::fs::File;
-use std::io::{BufReader, Read};
 use std::process::Command;
 use crate::exception::InvalidData;
 
