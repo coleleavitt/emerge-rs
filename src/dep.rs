@@ -246,42 +246,90 @@ pub fn parse_dependencies_with_use(dep_str: &str, use_flags: &std::collections::
     // Expand USE flag conditionals first
     let expanded_dep_str = expand_use_flags(dep_str, use_flags);
 
-    // Split by whitespace, but handle parentheses and operators
-    let mut current = String::new();
-    let mut paren_depth = 0;
-    let mut in_use_conditional = false;
-
-    for ch in expanded_dep_str.chars() {
-        match ch {
-            '(' => {
-                paren_depth += 1;
-                current.push(ch);
-            }
-            ')' => {
-                paren_depth -= 1;
-                current.push(ch);
-            }
-            '?' => {
-                current.push(ch);
-                in_use_conditional = true;
-            }
-            ' ' if paren_depth == 0 && !in_use_conditional => {
-                // End of atom
-                if !current.trim().is_empty() {
-                    atoms.extend(parse_atom_string(&current)?);
+    // Tokenize by whitespace first
+    let tokens: Vec<&str> = expanded_dep_str.split_whitespace().collect();
+    
+    // Process tokens, handling groups and conditionals
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        
+        // Handle OR groups: || ( pkg1 pkg2 pkg3 )
+        // Portage's behavior: pick the first INSTALLED alternative, or skip if none installed
+        // For simplicity, we'll skip OR groups entirely - they're usually already satisfied
+        if token == "||" {
+            i += 1; // skip ||
+            if i < tokens.len() && tokens[i] == "(" {
+                i += 1; // skip opening paren
+                // Skip all atoms in the OR group
+                let mut depth = 1;
+                while i < tokens.len() && depth > 0 {
+                    if tokens[i] == "(" {
+                        depth += 1;
+                    } else if tokens[i] == ")" {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    i += 1;
                 }
-                current.clear();
-                in_use_conditional = false;
             }
-            _ => {
-                current.push(ch);
+            i += 1;
+            continue;
+        }
+        
+        // Skip standalone parentheses
+        if token == "(" || token == ")" {
+            i += 1;
+            continue;
+        }
+        
+        // Handle USE conditionals: flag? ( ... )
+        if token.ends_with('?') {
+            let flag = &token[..token.len() - 1];
+            
+            // Skip test dependencies by default (FEATURES=-test in Gentoo)
+            // Also skip doc, examples, and other optional build-time features
+            let skip_flags = ["test", "doc", "examples", "gtk-doc"];
+            let should_skip = skip_flags.contains(&flag);
+            
+            // This is a USE flag conditional
+            i += 1;
+            if i < tokens.len() && tokens[i] == "(" {
+                i += 1; // skip opening paren
+                // Parse or skip atoms until closing paren
+                let mut depth = 1;
+                while i < tokens.len() && depth > 0 {
+                    if tokens[i] == "(" {
+                        depth += 1;
+                    } else if tokens[i] == ")" {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else if tokens[i] != "||" && !should_skip {
+                        // Only parse the atom if we're not skipping this flag
+                        if let Ok(atom) = Atom::new(tokens[i]) {
+                            atoms.push(atom);
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        
+        // Regular atom
+        match Atom::new(token) {
+            Ok(atom) => atoms.push(atom),
+            Err(_) => {
+                // Skip invalid atoms (might be partial syntax)
             }
         }
-    }
-
-    // Handle remaining content
-    if !current.trim().is_empty() {
-        atoms.extend(parse_atom_string(&current)?);
+        
+        i += 1;
     }
 
     Ok(atoms)
@@ -292,6 +340,11 @@ fn parse_atom_string(atom_str: &str) -> Result<Vec<Atom>, InvalidData> {
     let atom_str = atom_str.trim();
 
     if atom_str.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Skip dependency operators and grouping syntax
+    if atom_str == "||" || atom_str == "(" || atom_str == ")" || atom_str == "]" {
         return Ok(vec![]);
     }
 

@@ -284,7 +284,13 @@ impl PortTree {
             }
         }
 
-        // Not in cache, try to load from ebuild
+        // Try to load from md5-cache first (faster and more accurate)
+        if let Some(metadata) = self.load_from_md5_cache(cpv).await {
+            self.cache_metadata(cpv, metadata.clone());
+            return Some(metadata);
+        }
+
+        // Fallback: try to load from ebuild
         if let Some(ebuild_path) = self.get_ebuild_path(cpv) {
             if let Ok(content) = tokio::fs::read_to_string(&ebuild_path).await {
                 use crate::doebuild::Ebuild;
@@ -307,6 +313,39 @@ impl PortTree {
             }
         }
 
+        None
+    }
+
+    /// Load metadata from md5-cache
+    async fn load_from_md5_cache(&self, cpv: &str) -> Option<HashMap<String, String>> {
+        // Parse CPV: should be in format "category/package-version"
+        // md5-cache path: {repo}/metadata/md5-cache/category/package-version
+        
+        // Split into category and package-version
+        if let Some((category, pv)) = cpv.split_once('/') {
+            // Try each repository
+            for repo in self.repositories.values() {
+                let cache_file = format!("{}/metadata/md5-cache/{}/{}",
+                    repo.location,
+                    category,
+                    pv);
+                
+                if let Ok(content) = tokio::fs::read_to_string(&cache_file).await {
+                    let mut metadata = HashMap::new();
+                    
+                    for line in content.lines() {
+                        if let Some(eq_pos) = line.find('=') {
+                            let key = &line[..eq_pos];
+                            let value = &line[eq_pos + 1..];
+                            metadata.insert(key.to_string(), value.to_string());
+                        }
+                    }
+                    
+                    return Some(metadata);
+                }
+            }
+        }
+        
         None
     }
 
