@@ -209,17 +209,17 @@ impl PortTree {
     pub fn get_ebuild_path(&self, cpv: &str) -> Option<String> {
         // Parse CPV: category/package-version using pkgsplit
         use crate::versions::pkgsplit;
-        
+
         if let Some((cat_pkg, ver, rev)) = pkgsplit(cpv) {
             // cat_pkg is "category/package"
             let parts: Vec<&str> = cat_pkg.split('/').collect();
             if parts.len() != 2 {
                 return None;
             }
-            
+
             let category = parts[0];
             let package = parts[1];
-            
+
             // Reconstruct version with revision
             let full_version = if rev == "r0" {
                 ver
@@ -234,6 +234,41 @@ impl PortTree {
 
                 if std::path::Path::new(&ebuild_path).exists() {
                     return Some(ebuild_path);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn get_ebuild_path_and_repo(&self, cpv: &str) -> Option<(String, String)> {
+        // Parse CPV: category/package-version using pkgsplit
+        use crate::versions::pkgsplit;
+
+        if let Some((cat_pkg, ver, rev)) = pkgsplit(cpv) {
+            // cat_pkg is "category/package"
+            let parts: Vec<&str> = cat_pkg.split('/').collect();
+            if parts.len() != 2 {
+                return None;
+            }
+
+            let category = parts[0];
+            let package = parts[1];
+
+            // Reconstruct version with revision
+            let full_version = if rev == "r0" {
+                ver
+            } else {
+                format!("{}-{}", ver, rev)
+            };
+
+            // Check each repository
+            for (repo_name, repo) in &self.repositories {
+                let ebuild_path = format!("{}/{}/{}/{}-{}.ebuild",
+                    repo.location, category, package, package, full_version);
+
+                if std::path::Path::new(&ebuild_path).exists() {
+                    return Some((ebuild_path, repo_name.clone()));
                 }
             }
         }

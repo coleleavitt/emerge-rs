@@ -5,6 +5,16 @@ use emerge_rs::actions;
 
 #[tokio::main]
 async fn main() {
+    // Ignore SIGPIPE to handle broken pipes gracefully
+    // When output is piped to a command that exits early (like head),
+    // we want to exit cleanly rather than crash with SIGPIPE
+    unsafe {
+        let _ = nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGPIPE,
+            nix::sys::signal::SigHandler::SigIgn,
+        );
+    }
+
     env_logger::init();
 
     let app = create_app();

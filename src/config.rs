@@ -388,6 +388,31 @@ impl Config {
             self.binhost_mirrors = mirrors_str.split_whitespace().map(|s| s.to_string()).collect();
         }
     }
+
+    /// Get CONFIG_PROTECT paths
+    pub fn get_config_protect(&self) -> Vec<String> {
+        // Start with default CONFIG_PROTECT paths
+        let mut config_protect = vec![
+            "/etc".to_string(),
+            "/usr/share/config".to_string(),
+        ];
+
+        // Add CONFIG_PROTECT from profile
+        if let Some(cp_str) = self.profile_settings.variables.get("CONFIG_PROTECT") {
+            config_protect.extend(cp_str.split_whitespace().map(|s| s.to_string()));
+        }
+
+        // Add CONFIG_PROTECT from make.conf (can override profile)
+        if let Some(cp_str) = self.make_conf.get("CONFIG_PROTECT") {
+            config_protect.extend(cp_str.split_whitespace().map(|s| s.to_string()));
+        }
+
+        // Remove duplicates while preserving order
+        let mut seen = std::collections::HashSet::new();
+        config_protect.retain(|path| seen.insert(path.clone()));
+
+        config_protect
+    }
 }
 
 #[cfg(test)]

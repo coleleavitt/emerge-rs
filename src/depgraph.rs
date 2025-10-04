@@ -36,6 +36,8 @@ pub struct ResolutionResult {
     pub resolved: Vec<String>,
     pub blocked: Vec<String>,
     pub circular: Vec<String>,
+    pub backtrack_count: usize,
+    pub resolution_time_ms: u128,
 }
 
 impl DepGraph {
@@ -110,32 +112,47 @@ impl DepGraph {
     }
     
     pub fn resolve_with_backtracking(&self, targets: &[String]) -> Result<ResolutionResult, InvalidData> {
+        let start_time = std::time::Instant::now();
         let mut backtrack_count = 0;
-        
+
         loop {
             match self.resolve_advanced(targets) {
                 Ok(result) => {
                     if result.blocked.is_empty() && result.circular.is_empty() {
-                        return Ok(result);
+                        let elapsed = start_time.elapsed().as_millis();
+                        return Ok(ResolutionResult {
+                            resolved: result.resolved,
+                            blocked: result.blocked,
+                            circular: result.circular,
+                            backtrack_count,
+                            resolution_time_ms: elapsed,
+                        });
                     }
-                    
+
                     if backtrack_count >= self.backtrack_limit {
+                        let elapsed = start_time.elapsed().as_millis();
                         if !result.blocked.is_empty() {
                             return Err(InvalidData::new(
-                                &format!("Cannot resolve dependencies after {} backtrack attempts. Blocked packages: {:?}", 
-                                         backtrack_count, result.blocked), 
+                                &format!("Cannot resolve dependencies after {} backtrack attempts. Blocked packages: {:?}",
+                                         backtrack_count, result.blocked),
                                 None
                             ));
                         }
                         if !result.circular.is_empty() {
                             return Err(InvalidData::new(
-                                &format!("Circular dependencies detected: {:?}", result.circular), 
+                                &format!("Circular dependencies detected: {:?}", result.circular),
                                 None
                             ));
                         }
-                        return Ok(result);
+                        return Ok(ResolutionResult {
+                            resolved: result.resolved,
+                            blocked: result.blocked,
+                            circular: result.circular,
+                            backtrack_count,
+                            resolution_time_ms: elapsed,
+                        });
                     }
-                    
+
                     backtrack_count += 1;
                 }
                 Err(e) => {
@@ -277,6 +294,8 @@ impl DepGraph {
             resolved: resolved_vec,
             blocked,
             circular,
+            backtrack_count: 0,
+            resolution_time_ms: 0,
         })
     }
 

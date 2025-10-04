@@ -24,6 +24,8 @@ struct MergePlanItem {
     slot: Option<String>,
     size: Option<u64>,
     use_changes: Vec<(String, bool)>,
+    repository: Option<String>,
+    abi: Option<String>,
 }
 
 pub async fn action_sync() -> i32 {
@@ -420,7 +422,11 @@ async fn create_merge_plan(
 
         let metadata = porttree.get_metadata(cpv).await;
         let slot = metadata.as_ref().and_then(|m| m.get("SLOT").map(|s| s.clone()));
-        
+        let abi = metadata.as_ref().and_then(|m| m.get("ABI").map(|s| s.clone()));
+
+        // Get repository name
+        let repository = porttree.get_ebuild_path_and_repo(cpv).map(|(_, repo)| repo);
+
         // Get actual download size from distfiles or SRC_URI
         let size = if let Some(m) = metadata.as_ref() {
             if let Some(src_uri) = m.get("SRC_URI") {
@@ -439,6 +445,8 @@ async fn create_merge_plan(
             slot,
             size,
             use_changes: vec![],
+            repository,
+            abi,
         });
     }
 
@@ -461,16 +469,17 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn display_merge_plan(plan: &[MergePlanItem]) {
+fn display_merge_plan(plan: &[MergePlanItem], config_protect_conflicts: &[String], masked_packages: &[(String, String)], unaccepted_licenses: &[(String, String)]) {
     println!("\nThese are the packages that would be merged, in order:\n");
 
     let mut total_size = 0u64;
     for item in plan {
+        // Format status indicator like Portage: [ebuild  U ]
         let status_indicator = match item.status {
-            PackageStatus::New => "[N]",
-            PackageStatus::Upgrade => "[U]",
-            PackageStatus::Rebuild => "[R]",
-            PackageStatus::Downgrade => "[D]",
+            PackageStatus::New => "[ebuild  N ]",
+            PackageStatus::Upgrade => "[ebuild  U ]",
+            PackageStatus::Rebuild => "[ebuild  R ]",
+            PackageStatus::Downgrade => "[ebuild  D ]",
         };
 
         // Extract version from CPV using pkgsplit
@@ -502,25 +511,144 @@ fn display_merge_plan(plan: &[MergePlanItem]) {
             String::new()
         };
 
-        let size_info = if let Some(size) = item.size {
-            total_size += size;
-            format!(" [{}]", format_size(size))
+        let repo_info = if let Some(ref repo) = item.repository {
+            format!(" ::{}", repo)
         } else {
             String::new()
         };
 
-        println!("{} {}{} {}{}", 
-                 status_indicator, 
-                 item.cpv, 
+        let abi_info = if let Some(ref abi) = item.abi {
+            format!(" ABI={}", abi)
+        } else {
+            String::new()
+        };
+
+        let size_info = if let Some(size) = item.size {
+            total_size += size;
+            format!(" {} KiB", size / 1024)
+        } else {
+            String::new()
+        };
+
+        // Show USE flag changes for upgrades
+        let use_info = if !item.use_changes.is_empty() && matches!(item.status, PackageStatus::Upgrade) {
+            let enabled: Vec<String> = item.use_changes.iter()
+                .filter(|(_, enabled)| *enabled)
+                .map(|(flag, _)| flag.clone())
+                .collect();
+            let disabled: Vec<String> = item.use_changes.iter()
+                .filter(|(_, enabled)| !*enabled)
+                .map(|(flag, _)| format!("-{}", flag))
+                .collect();
+            let mut all_changes = enabled;
+            all_changes.extend(disabled);
+            format!(" USE=\"{}\"", all_changes.join(" "))
+        } else {
+            String::new()
+        };
+
+        println!("{}{}{}{}{}{}{}{}",
+                 status_indicator,
+                 item.cpv,
                  slot_info,
                  version_info,
+                 abi_info,
+                 use_info,
+                 repo_info,
                  size_info);
     }
-    
+
     if total_size > 0 {
-        println!("\nTotal download size: {}", format_size(total_size));
+        println!("\nTotal: {} packages, Size of downloads: {} KiB", plan.len(), total_size / 1024);
+    } else {
+        println!("\nTotal: {} packages", plan.len());
     }
-    println!();
+
+    // Display masked packages
+    if !masked_packages.is_empty() {
+        println!("\n!!! The following packages are masked:");
+        for (cpv, reason) in masked_packages {
+            println!("!!! {}: {}", cpv, reason);
+        }
+        println!("!!! To proceed, you may need to unmask these packages.");
+        println!();
+    }
+
+    // Display license alerts
+    if !unaccepted_licenses.is_empty() {
+        println!("\n!!! The following packages have unaccepted licenses:");
+        let mut package_licenses: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for (cpv, license) in unaccepted_licenses {
+            package_licenses.entry(cpv.clone()).or_insert_with(Vec::new).push(license.clone());
+        }
+        for (cpv, licenses) in &package_licenses {
+            println!("!!! {}: {}", cpv, licenses.join(", "));
+        }
+        println!("!!! You must accept these licenses to proceed.");
+        println!();
+    }
+
+    // Display CONFIG_PROTECT warnings
+    if !config_protect_conflicts.is_empty() {
+        println!("\n!!! CONFIG_PROTECT is active for the following files:");
+        for conflict in config_protect_conflicts {
+            println!("!!! {}", conflict);
+        }
+        println!("!!! This means that the new files will not overwrite the existing ones.");
+        println!("!!! You will need to manually merge the .new files with the existing ones.");
+        println!();
+    }
+}
+
+async fn check_config_protect_conflicts(
+    merge_plan: &[MergePlanItem],
+    config: &crate::config::Config,
+    vartree: &crate::vartree::VarTree,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conflicts = Vec::new();
+    let config_protect_paths = config.get_config_protect();
+
+    for item in merge_plan {
+        // Only check for upgrades and rebuilds (not new installs)
+        if matches!(item.status, PackageStatus::New) {
+            continue;
+        }
+
+        // Get the installed package database entry
+        let installed = vartree.get_all_installed().await.unwrap_or_default();
+        let cp_hyphenated = item.cpv.split('-').take(2).collect::<Vec<_>>().join("-");
+
+        if let Some(installed_cpv) = installed.iter().find(|cpv| cpv.starts_with(&cp_hyphenated)) {
+            let pkg_db_path = std::path::Path::new("/var/db/pkg").join(installed_cpv);
+
+            // Read the CONTENTS file to see what files are installed
+            let contents_file = pkg_db_path.join("CONTENTS");
+            if contents_file.exists() {
+                if let Ok(contents) = std::fs::read_to_string(&contents_file) {
+                    for line in contents.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 && parts[0] == "obj" {
+                            let file_path = parts[1];
+
+                            // Check if this file is in a CONFIG_PROTECT directory
+                            for protect_path in &config_protect_paths {
+                                if file_path.starts_with(protect_path) {
+                                    // Check if the file exists on disk
+                                    let full_path = std::path::Path::new(&config.root).join(&file_path[1..]); // Remove leading /
+                                    if full_path.exists() {
+                                        conflicts.push(format!("{}: {}", item.cpv, file_path));
+                                    }
+                                    break; // Found a match, no need to check other protect paths
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(conflicts)
 }
 
 async fn check_reverse_dependencies(
@@ -951,6 +1079,10 @@ pub async fn action_install_with_root(
             }
 
             println!("Resolved packages to install: {:?}", result.resolved);
+            println!("Dependency resolution took {:.2} ms", result.resolution_time_ms as f64);
+            if result.backtrack_count > 0 {
+                println!("Dependency resolution required {} backtrack attempts", result.backtrack_count);
+            }
 
             // Check if dependencies are satisfied (skip in pretend mode)
             if !pretend_mode {
@@ -993,15 +1125,15 @@ pub async fn action_install_with_root(
                 }
             }
 
-            // Check for masked packages
-    let mask_manager = crate::mask::MaskManager::new("/", config.accept_keywords.clone());
+            // Check for masked packages and collect masking information
+            let mask_manager = crate::mask::MaskManager::new("/", config.accept_keywords.clone());
+            let mut masked_packages = Vec::new();
             for cpv in &cpv_packages {
                 match Atom::new(cpv) {
                     Ok(atom) => {
                         match mask_manager.is_masked(&atom).await {
                             Ok(Some(reason)) => {
-                                eprintln!("Package {} is masked: {}", cpv, reason);
-                                return 1;
+                                masked_packages.push((cpv.clone(), reason));
                             }
                             Ok(None) => {
                                 // Package is not masked, continue
@@ -1019,20 +1151,15 @@ pub async fn action_install_with_root(
                 }
             }
 
-            // Check license acceptance for all packages to be installed
+            // Check license acceptance and collect license information
             let license_manager = crate::license::LicenseManager::new("/");
-            match license_manager.check_and_prompt_licenses(&cpv_packages, &mut porttree, pretend_mode).await {
-                Ok(accepted) => {
-                    if !accepted {
-                        eprintln!("License acceptance required. Aborting installation.");
-                        return 1;
-                    }
-                }
+            let unaccepted_licenses = match license_manager.get_unaccepted_licenses(&cpv_packages, &mut porttree).await {
+                Ok(licenses) => licenses,
                 Err(e) => {
                     eprintln!("License check failed: {}", e);
                     return 1;
                 }
-            }
+            };
 
             // Display unread news items
             let news_manager = NewsManager::new("/");
@@ -1061,8 +1188,41 @@ pub async fn action_install_with_root(
                     return 1;
                 }
             };
-            
-            display_merge_plan(&merge_plan);
+
+            // Check for CONFIG_PROTECT conflicts
+            let config_protect_conflicts = match check_config_protect_conflicts(&merge_plan, &config, &vartree).await {
+                Ok(conflicts) => conflicts,
+                Err(e) => {
+                    eprintln!("Warning: Failed to check CONFIG_PROTECT conflicts: {}", e);
+                    vec![]
+                }
+            };
+
+            display_merge_plan(&merge_plan, &config_protect_conflicts, &masked_packages, &unaccepted_licenses);
+
+            // Check for masked packages - if any are masked, we cannot proceed
+            if !masked_packages.is_empty() {
+                eprintln!("Cannot proceed: some packages are masked.");
+                return 1;
+            }
+
+            // Prompt for license acceptance
+            if !unaccepted_licenses.is_empty() && !pretend_mode {
+                println!("Do you accept the licenses for the above packages? [y/N]");
+                use std::io::{self, BufRead};
+                let stdin = io::stdin();
+                let mut response = String::new();
+                if let Ok(_) = stdin.lock().read_line(&mut response) {
+                    let response = response.trim().to_lowercase();
+                    if response != "y" && response != "yes" {
+                        println!("License acceptance declined. Aborting installation.");
+                        return 1;
+                    }
+                } else {
+                    println!("Failed to read input, aborting.");
+                    return 1;
+                }
+            }
 
             if ask {
                 println!("Would you like to proceed? (y/N) ");
@@ -1652,6 +1812,11 @@ pub async fn action_upgrade(packages: &[String], pretend: bool, ask: bool, deep:
                 return 1;
             }
 
+            println!("Dependency resolution took {:.2} ms", result.resolution_time_ms as f64);
+            if result.backtrack_count > 0 {
+                println!("Dependency resolution required {} backtrack attempts", result.backtrack_count);
+            }
+
             // Get CPVs for all resolved packages
             let mut all_cpvs = Vec::new();
             for cp in &result.resolved {
@@ -1668,7 +1833,17 @@ pub async fn action_upgrade(packages: &[String], pretend: bool, ask: bool, deep:
                     return 1;
                 }
             };
-            display_merge_plan(&merge_plan);
+
+            // Check for CONFIG_PROTECT conflicts
+            let config_protect_conflicts = match check_config_protect_conflicts(&merge_plan, &config, &vartree).await {
+                Ok(conflicts) => conflicts,
+                Err(e) => {
+                    eprintln!("Warning: Failed to check CONFIG_PROTECT conflicts: {}", e);
+                    vec![]
+                }
+            };
+
+            display_merge_plan(&merge_plan, &config_protect_conflicts, &[], &[]);
         }
         Err(e) => {
             eprintln!("Dependency resolution failed: {}", e);

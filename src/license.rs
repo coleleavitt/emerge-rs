@@ -160,6 +160,32 @@ impl LicenseManager {
 
     /// Check licenses for a list of packages and prompt for acceptance if needed
     /// Returns true if all licenses are accepted or user accepts them
+    /// Get unaccepted licenses for packages without prompting
+    pub async fn get_unaccepted_licenses(&self, packages: &[String], porttree: &mut crate::porttree::PortTree) -> Result<Vec<(String, String)>, InvalidData> {
+        let mut unaccepted_licenses = Vec::new();
+
+        // Collect all unique licenses that need acceptance
+        for cpv in packages {
+            if let Some(metadata) = porttree.get_metadata(cpv).await {
+                if let Some(license_str) = metadata.get("LICENSE") {
+                    if !self.is_license_accepted(license_str)? {
+                        // Parse license groups and collect unaccepted ones
+                        let groups = Self::parse_license_string(license_str)?;
+                        for group in groups {
+                            for license in group {
+                                if !self.get_accepted_licenses()?.contains(&license) {
+                                    unaccepted_licenses.push((cpv.clone(), license));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(unaccepted_licenses)
+    }
+
     pub async fn check_and_prompt_licenses(&self, packages: &[String], porttree: &mut crate::porttree::PortTree, pretend: bool) -> Result<bool, InvalidData> {
         if pretend {
             // In pretend mode, skip license prompting
