@@ -1081,9 +1081,11 @@ pub async fn action_upgrade(
     let mut depgraph = DepGraph::with_use_flags(use_flags);
 
     // Parse atoms from the best CPVs for dependency resolution
+    // Need to add '=' operator so Atom::new() parses the version correctly
     let mut target_atoms = Vec::new();
     for cpv in &target_cpvs {
-        match Atom::new(cpv) {
+        let atom_str = format!("={}", cpv);
+        match Atom::new(&atom_str) {
             Ok(atom) => target_atoms.push(atom),
             Err(e) => {
                 eprintln!("Invalid CPV '{}': {}", cpv, e);
@@ -1101,7 +1103,9 @@ pub async fn action_upgrade(
     println!("Dependency calculation complete.");
 
     // Resolve dependencies using BFS resolver
-    match depgraph.resolve_advanced(&target_cpvs) {
+    // Extract CPs from CPVs since the graph is keyed by CP
+    let target_cps: Vec<String> = target_atoms.iter().map(|a| a.cp()).collect();
+    match depgraph.resolve_advanced(&target_cps) {
         Ok(result) => {
             if !result.blocked.is_empty() {
                 eprintln!("Blocked packages: {:?}", result.blocked);
@@ -1122,44 +1126,54 @@ pub async fn action_upgrade(
             let installed = vartree.get_all_installed().await.unwrap_or_default();
 
             let mut packages_to_upgrade = Vec::new();
-            for cpv in &result.resolved {
-                // Extract CP from CPV
-                if let Some(last_dash) = cpv.rfind('-') {
-                    let cp_hyphenated = &cpv[..last_dash];
-                    let cp = cp_hyphenated.replace('-', "/");
+            for cp in &result.resolved {
+                // The resolved list contains CPs, not CPVs
+                // Check if this package needs upgrading
+                if let Ok(Some(available_cpv)) = merger.find_best_version_with_porttree(&cp, Some(&porttree)).await {
+                    // Check if the available version is masked
+                    let available_atom_str = format!("={}", available_cpv);
+                    if let Ok(available_atom) = crate::atom::Atom::new(&available_atom_str) {
+                        if let Some(_mask_reason) = mask_manager.is_masked(&available_atom).await.unwrap_or(None) {
+                            continue;
+                        }
+                    }
 
-                    // Check if this package needs upgrading
-                    if let Ok(Some(available_cpv)) = merger.find_best_version_with_porttree(&cp, Some(&porttree)).await {
-                        // Check if the available version is masked
-                        if let Ok(available_atom) = crate::atom::Atom::new(&available_cpv) {
-                            if let Some(_mask_reason) = mask_manager.is_masked(&available_atom).await.unwrap_or(None) {
-                                continue;
+                    // Use pkgsplit to properly extract version from CPV
+                    if let Some((_cat_pkg, avail_ver, avail_rev)) = crate::versions::pkgsplit(&available_cpv) {
+                        let available_version = if avail_rev == "r0" {
+                            avail_ver
+                        } else {
+                            format!("{}-{}", avail_ver, avail_rev)
+                        };
+
+                        // Check if installed
+                        let cp_hyphenated = cp.replace('/', "-");
+                        let search_prefix = format!("{}-", cp_hyphenated);
+                        let mut found_installed = None;
+                        
+                        for installed_cpv in &installed {
+                            if installed_cpv.starts_with(&search_prefix) {
+                                // Use pkgsplit to extract version from installed CPV
+                                let version_part = installed_cpv.trim_start_matches(&search_prefix);
+                                let installed_full = format!("{}-{}", cp, version_part);
+                                if let Some((_cat_pkg, inst_ver, inst_rev)) = crate::versions::pkgsplit(&installed_full) {
+                                    let installed_version = if inst_rev == "r0" {
+                                        inst_ver
+                                    } else {
+                                        format!("{}-{}", inst_ver, inst_rev)
+                                    };
+                                    found_installed = Some(installed_version);
+                                }
+                                break;
                             }
                         }
 
-                        // Extract version from available CPV
-                        if let Some(avail_last_dash) = available_cpv.rfind('-') {
-                            let available_version = &available_cpv[avail_last_dash + 1..];
-
-                            // Check if installed
-                            let cp_hyphenated_check = cp.replace('/', "-");
-                            let mut found_installed = None;
-                            for installed_cpv in &installed {
-                                if installed_cpv.starts_with(&format!("{}-", cp_hyphenated_check)) {
-                                    if let Some(installed_last_dash) = installed_cpv.rfind('-') {
-                                        found_installed = Some(installed_cpv[installed_last_dash + 1..].to_string());
-                                    }
-                                    break;
-                                }
-                            }
-
-                            if let Some(installed_version) = found_installed {
-                                // Compare versions
-                                if let Some(cmp) = crate::versions::vercmp(&installed_version, available_version) {
-                                    if cmp < 0 {
-                                        // installed < available
-                                        packages_to_upgrade.push((cp, installed_version, available_version.to_string()));
-                                    }
+                        if let Some(installed_version) = found_installed {
+                            // Compare versions
+                            if let Some(cmp) = crate::versions::vercmp(&installed_version, &available_version) {
+                                if cmp < 0 {
+                                    // installed < available
+                                    packages_to_upgrade.push((cp.clone(), installed_version, available_version.to_string()));
                                 }
                             }
                         }

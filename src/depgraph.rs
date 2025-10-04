@@ -271,7 +271,6 @@ impl DepGraph {
             }
         }
 
-        eprintln!("DEBUG: Starting resolution with {} targets, graph has {} nodes", to_process.len(), self.nodes.len());
         let mut visited = HashSet::new();
 
         while let Some(current) = to_process.pop_front() {
@@ -395,8 +394,7 @@ impl DepGraph {
         let elapsed = start_time.elapsed();
         let elapsed_ms = elapsed.as_millis() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000.0;
 
-        eprintln!("DEBUG: Resolution completed in {:.3} ms, found {} resolved packages, {} blocked, {} circular",
-                 elapsed_ms, resolved_vec.len(), blocked.len(), circular.len());
+
 
         Ok(ResolutionResult {
             resolved: resolved_vec,
